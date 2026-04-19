@@ -42,6 +42,10 @@ import {
 } from "./heartbeat-run-summary.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import {
+  buildAdapterContextScope,
+  AdapterContextScopeError,
+} from "./adapter-context-scope.js";
+import {
   buildWorkspaceReadyComment,
   cleanupExecutionWorkspaceArtifacts,
   ensureRuntimeServicesForRun,
@@ -3867,6 +3871,52 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      // NEW 3 V1 (-tne): populate AdapterExecutionContext.scope from the
+      // agent's envelope (permissions.allowlist). Pre-dispatch enforcement:
+      // a gated-level agent with an empty envelope is rejected BEFORE the
+      // adapter spawn — it would have had nothing to constrain.
+      let adapterScope: ReturnType<typeof buildAdapterContextScope>["scope"];
+      try {
+        const built = buildAdapterContextScope({
+          permissions: agent.permissions,
+          role: agent.role,
+          workingDir: executionWorkspace.cwd,
+        });
+        adapterScope = built.scope;
+      } catch (err) {
+        if (err instanceof AdapterContextScopeError && err.code === "gated_empty_envelope") {
+          await logActivity(db, {
+            companyId: agent.companyId,
+            actorType: "system",
+            actorId: "adapter-scope-guard",
+            agentId: agent.id,
+            runId: run.id,
+            action: "allowlist.violated",
+            entityType: "agent",
+            entityId: agent.id,
+            details: {
+              reason: "gated_empty_envelope",
+              phase: "pre-dispatch",
+              message:
+                "gated-level agent has empty allowlist envelope; spawn rejected",
+            },
+          });
+          await setRunStatus(run.id, "failed", {
+            error: "gated-level agent has empty allowlist envelope",
+            errorCode: "allowlist.violated",
+            finishedAt: new Date(),
+          });
+          await setWakeupStatus(run.wakeupRequestId, "failed", {
+            finishedAt: new Date(),
+            error: "gated-level agent has empty allowlist envelope",
+          });
+          const rejectedRun = await getRun(run.id);
+          if (rejectedRun) await releaseIssueExecutionAndPromote(rejectedRun);
+          await finalizeAgentStatus(agent.id, "failed");
+          return;
+        }
+        throw err;
+      }
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
@@ -3886,6 +3936,7 @@ export function heartbeatService(db: Db) {
           });
         },
         authToken: authToken ?? undefined,
+        ...(adapterScope ? { scope: adapterScope } : {}),
       });
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
