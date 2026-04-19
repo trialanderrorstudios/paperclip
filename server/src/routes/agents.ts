@@ -59,6 +59,11 @@ import {
   capToCompanyFloor,
   AutonomyStateMachineError,
 } from "../services/autonomy-state-machine.js";
+// NEW 3 V1 (-tne): pre-dispatch envelope check (Gap 2).
+import {
+  checkDeclaredSurfaceAgainstEnvelope,
+  type EnvelopeCheckVerdict,
+} from "../services/allowlist-check.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import {
@@ -1597,8 +1602,7 @@ export function agentRoutes(db: Db) {
       return;
     }
 
-    const requiresApproval = company.requireBoardApprovalForNewAgents;
-    const status = requiresApproval ? "pending_approval" : "idle";
+    let requiresApproval = company.requireBoardApprovalForNewAgents;
 
     // NEW 3 V1 (-tne): compose permissions jsonb with requested initial
     // autonomy level + allowlist, capped by company floor. Falls back to
@@ -1611,14 +1615,54 @@ export function agentRoutes(db: Db) {
       normalizedHireInput.permissions && typeof normalizedHireInput.permissions === "object"
         ? { ...(normalizedHireInput.permissions as Record<string, unknown>) }
         : {};
+    // Effective level at hire time: request → capped by floor, else role
+    // default. capToCompanyFloor here takes the MIN of the two.
+    const effectiveHireLevel: AutonomyLevel = requestedInitialAutonomyLevel
+      ? capToCompanyFloor(requestedInitialAutonomyLevel, companyFloor)
+      : capToCompanyFloor(
+          effectiveAutonomyLevel({}, normalizedHireInput.role),
+          companyFloor,
+        );
     if (requestedInitialAutonomyLevel) {
-      const capped = capToCompanyFloor(requestedInitialAutonomyLevel, companyFloor);
-      basePermissions.autonomyLevel = capped;
+      basePermissions.autonomyLevel = effectiveHireLevel;
     }
     if (requestedInitialAllowlist) {
       basePermissions.allowlist = requestedInitialAllowlist;
     }
     const composedPermissions = Object.keys(basePermissions).length > 0 ? basePermissions : undefined;
+
+    // NEW 3 V1 (-tne) Gap 2: pre-dispatch envelope check at hire time.
+    // The declared surface is whatever tools/paths the requester put in
+    // `initialAllowlist`. We check against the company-floor envelope
+    // (plan §5.1 — `autonomyPolicy.companyFloorAllowlist`). Verdict drives
+    // whether this hire auto-approves, queues a normal board review, or
+    // triggers an `allowlist.exception` branch.
+    const companyFloorEnvelope: AllowlistEnvelope =
+      (company.autonomyPolicy && typeof company.autonomyPolicy === "object"
+        ? ((company.autonomyPolicy as Record<string, unknown>)
+            .companyFloorAllowlist as AllowlistEnvelope | undefined)
+        : undefined) ?? {};
+    let envelopeVerdict: EnvelopeCheckVerdict = { kind: "allow" };
+    let envelopeExceptionApproval: Awaited<
+      ReturnType<typeof approvalsSvc.getById>
+    > | null = null;
+    if (requestedInitialAllowlist) {
+      envelopeVerdict = checkDeclaredSurfaceAgainstEnvelope({
+        level: effectiveHireLevel,
+        envelope: companyFloorEnvelope,
+        declaredTools: requestedInitialAllowlist.allowedTools,
+        declaredPaths: requestedInitialAllowlist.allowedPaths,
+      });
+    }
+    // Auto-approve at policy/autopilot when the declared surface fits the
+    // company floor envelope. Gated stays on the normal approval path.
+    // Deny → immediate reject + `allowlist.violated` emission, and we
+    // refuse to create the hire approval (the operator asked for out-of-
+    // envelope at an auto-trusted level; that's the exact violation).
+    if (envelopeVerdict.kind === "allow" && effectiveHireLevel !== "gated") {
+      requiresApproval = false;
+    }
+    const status = requiresApproval ? "pending_approval" : "idle";
 
     const createdAgent = await svc.create(companyId, {
       ...normalizedHireInput,
@@ -1631,6 +1675,39 @@ export function agentRoutes(db: Db) {
 
     let approval: Awaited<ReturnType<typeof approvalsSvc.getById>> | null = null;
     const actor = getActorInfo(req);
+
+    // NEW 3 V1 (-tne) Gap 2: DENY branch — declared surface hit an
+    // explicit company-floor deniedTool/deniedPath. Emit
+    // `allowlist.violated` and refuse to queue the hire approval.
+    // (The agent row is already created — left at pending_approval
+    //  with no approval; operator sees the violation in activity_log.)
+    if (envelopeVerdict.kind === "deny") {
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "allowlist.violated",
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          phase: "hire",
+          reason: envelopeVerdict.reason,
+          effectiveLevel: effectiveHireLevel,
+          violations: envelopeVerdict.violations.map((v) => ({
+            kind: v.kind,
+            value: v.value,
+            resultKind: v.result.kind,
+          })),
+        },
+      });
+      res.status(422).json({
+        error: "hire rejected: declared allowlist surface hits company-floor deny rule",
+        violations: envelopeVerdict.violations,
+      });
+      return;
+    }
 
     if (requiresApproval) {
       const requestedAdapterType = normalizedHireInput.adapterType ?? agent.adapterType;
@@ -1646,6 +1723,33 @@ export function agentRoutes(db: Db) {
         redactEventPayload(
           ((normalizedHireInput.metadata ?? agent.metadata ?? {}) as Record<string, unknown>),
         ) ?? {};
+      // NEW 3 V1 (-tne) Gap 2: ESCALATE branch — declared surface is
+      // outside the company-floor envelope at policy/autopilot. Queue
+      // an `allowlist.exception` approval (status pending) INSTEAD of
+      // a `hire_agent` approval. Board reviews + approves or rejects.
+      if (envelopeVerdict.kind === "escalate") {
+        envelopeExceptionApproval = await approvalsSvc.create(companyId, {
+          type: "allowlist.exception",
+          requestedByAgentId: actor.actorType === "agent" ? actor.actorId : null,
+          requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
+          status: "pending",
+          payload: {
+            agentId: agent.id,
+            phase: "hire",
+            declared: requestedInitialAllowlist,
+            envelopeSnapshot: companyFloorEnvelope,
+            violations: envelopeVerdict.violations.map((v) => ({
+              kind: v.kind,
+              value: v.value,
+              resultKind: v.result.kind,
+            })),
+          },
+          decisionNote: null,
+          decidedByUserId: null,
+          decidedAt: null,
+          updatedAt: new Date(),
+        });
+      }
       approval = await approvalsSvc.create(companyId, {
         type: "hire_agent",
         requestedByAgentId: actor.actorType === "agent" ? actor.actorId : null,
@@ -1669,6 +1773,10 @@ export function agentRoutes(db: Db) {
           metadata: requestedMetadata,
           agentId: agent.id,
           requestedByAgentId: actor.actorType === "agent" ? actor.actorId : null,
+          // NEW 3 V1 (-tne): link to the envelope exception approval when
+          // one was raised so the board UI can surface both together.
+          linkedAllowlistExceptionApprovalId:
+            envelopeExceptionApproval?.id ?? null,
           requestedConfigurationSnapshot: {
             adapterType: requestedAdapterType,
             adapterConfig: requestedAdapterConfig,
@@ -1732,8 +1840,31 @@ export function agentRoutes(db: Db) {
         details: { type: approval.type, linkedAgentId: agent.id },
       });
     }
+    // NEW 3 V1 (-tne) Gap 2: log the exception approval creation so the
+    // board UI surfaces the out-of-envelope flag alongside the hire.
+    if (envelopeExceptionApproval) {
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "approval.created",
+        entityType: "approval",
+        entityId: envelopeExceptionApproval.id,
+        details: {
+          type: envelopeExceptionApproval.type,
+          linkedAgentId: agent.id,
+          linkedHireApprovalId: approval?.id ?? null,
+        },
+      });
+    }
 
-    res.status(201).json({ agent, approval });
+    res.status(201).json({
+      agent,
+      approval,
+      allowlistExceptionApproval: envelopeExceptionApproval,
+    });
   });
 
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
