@@ -122,6 +122,20 @@ export interface AdapterExecutionContext {
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   authToken?: string;
+  /**
+   * Optional host-provided cancellation signal (NEW 0-B-1, -tne delta).
+   *
+   * Adapters SHOULD observe this signal and cancel in-flight work when it
+   * fires. This is additive — adapters that ignore it retain their existing
+   * behavior (pre-existing cancellation paths such as onSpawn child-process
+   * kill continue to work unchanged).
+   *
+   * WebSocket-only adapters (e.g. openclaw-gateway) that have no child
+   * process are the primary beneficiaries: they can close the socket and
+   * reject their execute() promise with an AbortError when the signal
+   * fires.
+   */
+  abortSignal?: AbortSignal;
 }
 
 export interface AdapterModel {

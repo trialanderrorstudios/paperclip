@@ -515,6 +515,12 @@ function buildStandardPaperclipPayload(
   };
 }
 
+function makeAbortError(message = "aborted"): Error {
+  const err = new Error(message);
+  err.name = "AbortError";
+  return err;
+}
+
 function normalizeUrl(input: string): URL | null {
   try {
     return new URL(input);
@@ -1042,6 +1048,13 @@ function extractResultText(value: unknown): string | null {
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  // NEW 0-B-1 (-tne): honor host-provided abortSignal. Early guard covers the
+  // "aborted before we ever connected" case. The per-iteration listener below
+  // handles abort mid-flight by closing the WS and throwing AbortError.
+  if (ctx.abortSignal?.aborted) {
+    throw makeAbortError("openclaw-gateway execute aborted before start");
+  }
+
   const urlValue = asString(ctx.config.url, "").trim();
   if (!urlValue) {
     return {
@@ -1240,6 +1253,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       onLog: ctx.onLog,
     });
 
+    // NEW 0-B-1 (-tne): per-iteration abort wiring. When the host signal
+    // fires mid-flight, close the WS and mark `aborted` so the catch-block
+    // converts whatever in-flight error surfaces (gateway closed / request
+    // timeout / send failure) into a clean AbortError throw.
+    let aborted = false;
+    const abortSignal = ctx.abortSignal;
+    const onAbort = () => {
+      aborted = true;
+      try {
+        void ctx.onLog(
+          "stderr",
+          "[openclaw-gateway] abort signal received; closing websocket\n",
+        );
+      } catch {
+        // best-effort logging only
+      }
+      try {
+        client.close();
+      } catch {
+        // best-effort close only
+      }
+    };
+    if (abortSignal) {
+      abortSignal.addEventListener("abort", onAbort, { once: true });
+    }
+
     try {
       deviceIdentity = disableDeviceAuth ? null : resolveDeviceIdentity(parseObject(ctx.config));
       if (deviceIdentity) {
@@ -1426,6 +1465,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(summary ? { summary } : {}),
       };
     } catch (err) {
+      // NEW 0-B-1 (-tne): if host aborted mid-flight, surface AbortError to
+      // the caller rather than the downstream WS-close/timeout message.
+      if (aborted || abortSignal?.aborted) {
+        throw makeAbortError("openclaw-gateway execute aborted");
+      }
+
       const message = err instanceof Error ? err.message : String(err);
       const lower = message.toLowerCase();
       const timedOut = lower.includes("timeout");
@@ -1486,6 +1531,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: asRecord(latestResultPayload),
       };
     } finally {
+      if (abortSignal) {
+        abortSignal.removeEventListener("abort", onAbort);
+      }
       client.close();
     }
   }
