@@ -1,4 +1,5 @@
 import { pgTable, uuid, text, timestamp, jsonb, index } from "drizzle-orm/pg-core";
+import { desc } from "drizzle-orm";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
@@ -22,5 +23,12 @@ export const activityLog = pgTable(
     companyCreatedIdx: index("activity_log_company_created_idx").on(table.companyId, table.createdAt),
     runIdIdx: index("activity_log_run_id_idx").on(table.runId),
     entityIdx: index("activity_log_entity_type_id_idx").on(table.entityType, table.entityId),
+    // NEW 3 V1 (-tne): index for graduation-signals 30-day per-agent scans.
+    // Added by migration 0058_tne_autonomy_graduation.sql.
+    agentCreatedActionIdx: index("activity_log_agent_created_action_idx").on(
+      table.agentId,
+      desc(table.createdAt),
+      table.action,
+    ),
   }),
 );
