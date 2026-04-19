@@ -220,6 +220,10 @@ export const APPROVAL_TYPES = [
   "approve_ceo_strategy",
   "budget_override_required",
   "request_board_approval",
+  // NEW 3 V1 (-tne): graduated autonomy approval types. Reuse the existing
+  // approvals primitive with these new flavors (CEO plan §5.1).
+  "autonomy.promotion",
+  "allowlist.exception",
 ] as const;
 export type ApprovalType = (typeof APPROVAL_TYPES)[number];
 
@@ -229,6 +233,10 @@ export const APPROVAL_STATUSES = [
   "approved",
   "rejected",
   "cancelled",
+  // NEW 3 V1 (-tne): demotion wins over pending promotion proposals — the
+  // proposal transitions to `invalidated` with a decisionNote recording the
+  // triggering demotion event. Avoids mis-reading as "cancelled" by user.
+  "invalidated",
 ] as const;
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 

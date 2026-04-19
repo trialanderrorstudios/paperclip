@@ -124,6 +124,22 @@ export type {
 } from "./issue.js";
 export type { Goal } from "./goal.js";
 export type { Approval, ApprovalComment } from "./approval.js";
+// NEW 3 V1 (-tne): graduated autonomy + allowlist envelope types.
+export {
+  AUTONOMY_LEVELS,
+  AUTONOMY_LEVEL_RANK,
+  AUTONOMY_ROLE_DEFAULTS,
+  AUTONOMY_DEMOTION_REASONS,
+  AUTONOMY_ACTIVITY_ACTIONS,
+} from "./autonomy.js";
+export type {
+  AutonomyLevel,
+  AllowlistEnvelope,
+  GraduationSignals,
+  AutonomyPolicy,
+  AutonomyDemotionReason,
+  AutonomyActivityAction,
+} from "./autonomy.js";
 export type {
   BudgetPolicy,
   BudgetPolicySummary,

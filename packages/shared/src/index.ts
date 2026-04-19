@@ -442,7 +442,38 @@ export {
   adapterScopeNetworkAccessSchema,
   type AdapterScope,
   type AdapterScopeNetworkAccess,
+  // NEW 3 V1 (-tne): autonomy validators.
+  autonomyLevelSchema,
+  autonomyDemotionReasonSchema,
+  allowlistEnvelopeSchema,
+  envelopeForLevelSchema,
+  autonomyPolicySchema,
+  agentAutonomyPatchSchema,
+  autonomyPromotionApprovalPayloadSchema,
+  allowlistExceptionApprovalPayloadSchema,
+  isValidPromotionStep,
+  isAutonomyDemotion,
+  type AgentAutonomyPatch,
+  type AutonomyPromotionApprovalPayload,
+  type AllowlistExceptionApprovalPayload,
 } from "./validators/index.js";
+
+// NEW 3 V1 (-tne): autonomy types + constants.
+export {
+  AUTONOMY_LEVELS,
+  AUTONOMY_LEVEL_RANK,
+  AUTONOMY_ROLE_DEFAULTS,
+  AUTONOMY_DEMOTION_REASONS,
+  AUTONOMY_ACTIVITY_ACTIONS,
+} from "./types/autonomy.js";
+export type {
+  AutonomyLevel,
+  AllowlistEnvelope,
+  GraduationSignals,
+  AutonomyPolicy,
+  AutonomyDemotionReason,
+  AutonomyActivityAction,
+} from "./types/autonomy.js";
 
 export {
   createCompanySchema,

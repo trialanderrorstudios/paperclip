@@ -16,6 +16,23 @@ export {
   type AdapterScopeNetworkAccess,
 } from "./adapter-scope.js";
 
+// NEW 3 V1 (-tne): graduated autonomy zod validators.
+export {
+  autonomyLevelSchema,
+  autonomyDemotionReasonSchema,
+  allowlistEnvelopeSchema,
+  envelopeForLevelSchema,
+  autonomyPolicySchema,
+  agentAutonomyPatchSchema,
+  autonomyPromotionApprovalPayloadSchema,
+  allowlistExceptionApprovalPayloadSchema,
+  isValidPromotionStep,
+  isAutonomyDemotion,
+  type AgentAutonomyPatch,
+  type AutonomyPromotionApprovalPayload,
+  type AllowlistExceptionApprovalPayload,
+} from "./autonomy.js";
+
 export {
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
