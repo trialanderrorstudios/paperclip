@@ -84,11 +84,32 @@ export interface BuildAdapterScopeResult {
 }
 
 /**
+ * Detect whether `permissions.autonomyLevel` was explicitly set vs
+ * defaulted via the role-defaults compat shim. The pre-dispatch reject
+ * rule only applies when the agent was EXPLICITLY gated (operator
+ * chose the level); compat-shim gated agents (empty permissions,
+ * pre-NEW-3-migration) must continue to run — otherwise upgrading a
+ * Paperclip instance to the fork would mass-break every existing agent.
+ */
+function hasExplicitAutonomyLevel(permissions: unknown): boolean {
+  if (!permissions || typeof permissions !== "object" || Array.isArray(permissions)) {
+    return false;
+  }
+  const raw = (permissions as Record<string, unknown>).autonomyLevel;
+  return raw === "gated" || raw === "policy" || raw === "autopilot";
+}
+
+/**
  * Compute the AdapterExecutionContext.scope for a run-spawn call.
  *
  * Pre-dispatch enforcement:
- * - `gated` + empty envelope → throws. Gated must be explicit; we refuse
- *   to spawn because there's nothing to enforce against.
+ * - `gated` (EXPLICITLY set in permissions.autonomyLevel) + empty
+ *   envelope → throws. The operator chose gated; there must be a
+ *   declared envelope to enforce. This is the plan §4.2 rule.
+ * - `gated` via compat-shim role-default + empty envelope → pass
+ *   through with `undefined` scope. These are legacy agents with
+ *   empty `permissions` jsonb; enforcing on them would mass-break
+ *   upstream-compatible deployments. Plan §5.3 compat-shim principle.
  * - `policy` + empty envelope → returns a locked-down scope with empty
  *   arrays (nothing matches; matcher reports ESCALATE for everything).
  *   The spawn still proceeds (it's advisory V1), but the envelope is
@@ -104,13 +125,25 @@ export function buildAdapterContextScope(
 ): BuildAdapterScopeResult {
   const level = effectiveAutonomyLevel(args.permissions, args.role ?? null);
   const envelope = readEnvelope(args.permissions);
+  const explicitLevel = hasExplicitAutonomyLevel(args.permissions);
 
   if (isEmptyEnvelope(envelope)) {
-    if (level === "gated") {
+    if (level === "gated" && explicitLevel) {
       throw new AdapterContextScopeError(
-        "gated-level agent has empty allowlist envelope; spawn rejected pre-dispatch",
+        "gated-level agent (explicit) has empty allowlist envelope; spawn rejected pre-dispatch",
         "gated_empty_envelope",
       );
+    }
+    if (level === "gated") {
+      // Compat-shim path: role-default gated + empty envelope + no
+      // explicit level → legacy agent, let it run unconstrained by
+      // the adapter-scope field. The adapter sees no `scope` at all
+      // and behaves exactly as it did pre-NEW-3.
+      return {
+        scope: args.workingDir ? { workingDir: args.workingDir } : undefined,
+        level,
+        envelope,
+      };
     }
     if (level === "policy") {
       // Locked-down: scope present but empty arrays. Matcher will

@@ -68,7 +68,7 @@ describe("buildAdapterContextScope — round-trip", () => {
 });
 
 describe("buildAdapterContextScope — pre-dispatch enforcement", () => {
-  it("gated + empty envelope → throws gated_empty_envelope", () => {
+  it("EXPLICIT gated + empty envelope → throws gated_empty_envelope", () => {
     expect(() =>
       buildAdapterContextScope({
         permissions: { autonomyLevel: "gated" },
@@ -84,6 +84,19 @@ describe("buildAdapterContextScope — pre-dispatch enforcement", () => {
       expect(e).toBeInstanceOf(AdapterContextScopeError);
       expect((e as AdapterContextScopeError).code).toBe("gated_empty_envelope");
     }
+  });
+
+  it("compat-shim gated (no explicit autonomyLevel) + empty envelope → pass through (no reject)", () => {
+    // Legacy agent with empty permissions defaults to role=gated via
+    // AUTONOMY_ROLE_DEFAULTS. Refusing to spawn would mass-break every
+    // upstream-compatible deployment on upgrade. Plan §5.3 compat-shim.
+    const result = buildAdapterContextScope({
+      permissions: {},
+      role: "engineer",
+      workingDir: "/tmp/ws",
+    });
+    expect(result.level).toBe("gated");
+    expect(result.scope).toEqual({ workingDir: "/tmp/ws" });
   });
 
   it("policy + empty envelope → locked-down scope (empty arrays)", () => {
@@ -123,25 +136,32 @@ describe("buildAdapterContextScope — pre-dispatch enforcement", () => {
 });
 
 describe("buildAdapterContextScope — edge cases", () => {
-  it("compat-shim read: empty permissions + ceo role → gated (and empty envelope → throw)", () => {
-    expect(() =>
-      buildAdapterContextScope({ permissions: {}, role: "ceo" }),
-    ).toThrow(AdapterContextScopeError);
+  it("compat-shim read: empty permissions + ceo role → gated (compat-shim, does NOT throw)", () => {
+    // Same compat-shim rule: no explicit autonomyLevel = legacy agent.
+    const result = buildAdapterContextScope({ permissions: {}, role: "ceo" });
+    expect(result.level).toBe("gated");
+    expect(result.scope).toBeUndefined();
   });
 
-  it("compat-shim read: empty permissions + policy-level role default is still gated (safe floor)", () => {
+  it("compat-shim read: empty permissions + engineer role → gated (compat-shim, does NOT throw)", () => {
     // Role defaults map all known roles to 'gated' per plan §3.3.
-    // Without an explicit autonomyLevel, the agent is gated — empty
-    // envelope throws.
-    expect(() =>
-      buildAdapterContextScope({ permissions: {}, role: "engineer" }),
-    ).toThrow(AdapterContextScopeError);
+    // Without an explicit autonomyLevel, this is the legacy compat-
+    // shim read — spawn proceeds with no scope.
+    const result = buildAdapterContextScope({
+      permissions: {},
+      role: "engineer",
+    });
+    expect(result.level).toBe("gated");
+    expect(result.scope).toBeUndefined();
   });
 
-  it("invalid permissions shape (null) → treated as empty", () => {
-    expect(() =>
-      buildAdapterContextScope({ permissions: null, role: "engineer" }),
-    ).toThrow(AdapterContextScopeError);
+  it("invalid permissions shape (null) → treated as empty (compat-shim, does NOT throw)", () => {
+    const result = buildAdapterContextScope({
+      permissions: null,
+      role: "engineer",
+    });
+    expect(result.level).toBe("gated");
+    expect(result.scope).toBeUndefined();
   });
 
   it("invalid envelope type (string) → treated as empty envelope", () => {
