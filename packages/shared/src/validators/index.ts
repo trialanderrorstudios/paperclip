@@ -10,6 +10,13 @@ export {
 } from "./instance.js";
 
 export {
+  adapterScopeSchema,
+  adapterScopeNetworkAccessSchema,
+  type AdapterScope,
+  type AdapterScopeNetworkAccess,
+} from "./adapter-scope.js";
+
+export {
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
   type UpsertBudgetPolicy,

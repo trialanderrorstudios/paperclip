@@ -136,6 +136,28 @@ export interface AdapterExecutionContext {
    * fires.
    */
   abortSignal?: AbortSignal;
+  /**
+   * Optional structured scope/allowlist envelope (NEW 0-B-2, -tne delta).
+   *
+   * Typed transport for what used to be splatted through the freeform
+   * `config.payloadTemplate`. Adapters that support scope enforcement
+   * SHOULD use these fields instead of parsing ad-hoc payload keys.
+   *
+   * V1 is ADVISORY — adapters (e.g. openclaw-gateway) serialize these
+   * fields into their spawn/handshake payload but do not enforce them
+   * at runtime. Runtime enforcement is V1.1 per the Overwatch-v3 plan.
+   *
+   * This is additive and safe for adapters to ignore: they see an extra
+   * optional field that does not affect existing code paths.
+   */
+  scope?: {
+    allowedTools?: string[];
+    allowedPaths?: string[];
+    deniedTools?: string[];
+    deniedPaths?: string[];
+    workingDir?: string;
+    networkAccess?: "none" | "localhost" | "full";
+  };
 }
 
 export interface AdapterModel {

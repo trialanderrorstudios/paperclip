@@ -438,6 +438,10 @@ export {
   instanceExperimentalSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
   type PatchInstanceExperimentalSettings,
+  adapterScopeSchema,
+  adapterScopeNetworkAccessSchema,
+  type AdapterScope,
+  type AdapterScopeNetworkAccess,
 } from "./validators/index.js";
 
 export {

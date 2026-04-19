@@ -521,6 +521,48 @@ function makeAbortError(message = "aborted"): Error {
   return err;
 }
 
+/**
+ * NEW 0-B-2 (-tne): serialize a host-provided structured scope envelope
+ * into the shape sent on the WS `agent` spawn frame.
+ *
+ * This is advisory at V1 — the openclaw protocol itself is not being
+ * modified. We just include the fields as a nested `scope` object so
+ * the downstream session can echo or log them; runtime enforcement is
+ * V1.1 per the Overwatch-v3 plan.
+ *
+ * Returns null when the scope is empty/undefined so we never emit a
+ * `scope: {}` for a context that did not ask for one.
+ */
+function serializeAdapterScope(
+  scope: AdapterExecutionContext["scope"],
+): Record<string, unknown> | null {
+  if (!scope) return null;
+  const out: Record<string, unknown> = {};
+  if (Array.isArray(scope.allowedTools) && scope.allowedTools.length > 0) {
+    out.allowedTools = [...scope.allowedTools];
+  }
+  if (Array.isArray(scope.allowedPaths) && scope.allowedPaths.length > 0) {
+    out.allowedPaths = [...scope.allowedPaths];
+  }
+  if (Array.isArray(scope.deniedTools) && scope.deniedTools.length > 0) {
+    out.deniedTools = [...scope.deniedTools];
+  }
+  if (Array.isArray(scope.deniedPaths) && scope.deniedPaths.length > 0) {
+    out.deniedPaths = [...scope.deniedPaths];
+  }
+  if (typeof scope.workingDir === "string" && scope.workingDir.trim().length > 0) {
+    out.workingDir = scope.workingDir;
+  }
+  if (
+    scope.networkAccess === "none" ||
+    scope.networkAccess === "localhost" ||
+    scope.networkAccess === "full"
+  ) {
+    out.networkAccess = scope.networkAccess;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 function normalizeUrl(input: string): URL | null {
   try {
     return new URL(input);
@@ -1154,6 +1196,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   if (typeof agentParams.timeout !== "number") {
     agentParams.timeout = waitTimeoutMs;
+  }
+
+  // NEW 0-B-2 (-tne): include structured scope on the WS spawn frame.
+  // Advisory only at V1 — openclaw-side enforcement lands in V1.1 per the
+  // Overwatch-v3 plan. We intentionally set this on agentParams.scope (the
+  // top-level `agent` method params) rather than nesting it under
+  // `paperclip.*`, keeping the envelope obvious to downstream consumers.
+  const serializedScope = serializeAdapterScope(ctx.scope);
+  if (serializedScope) {
+    agentParams.scope = serializedScope;
   }
 
   if (ctx.onMeta) {
