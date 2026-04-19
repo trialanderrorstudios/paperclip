@@ -23,6 +23,9 @@ import type {
 } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
+// NEW 3 V1 (-tne) Gap 4: budget-incident → autonomy-demotion observer.
+import { observeBudgetIncidentForDemotion } from "./budget-demotion-observer.js";
+import { logger } from "../middleware/logger.js";
 
 type ScopeRecord = {
   companyId: string;
@@ -391,7 +394,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         .then((rows) => rows[0] ?? null)
       : null;
 
-    return db
+    const insertedIncident = await db
       .insert(budgetIncidents)
       .values({
         companyId: policy.companyId,
@@ -410,6 +413,38 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       })
       .returning()
       .then((rows) => rows[0] ?? null);
+
+    // NEW 3 V1 (-tne) Gap 4: post-transaction autonomy demotion observer.
+    // Fire-and-forget: the demotion is an audit-log write + permissions
+    // jsonb patch on the agents row, NOT part of this budget-incident
+    // INSERT's semantics. A slow/failing demote must not roll back the
+    // incident record. V1 handles scopeType='agent' only; scopeType=
+    // 'company'/'project' fan-out is V1.1.
+    if (insertedIncident && policy.scopeType === "agent") {
+      void Promise.resolve()
+        .then(() =>
+          observeBudgetIncidentForDemotion(db, {
+            incidentId: insertedIncident.id,
+            companyId: insertedIncident.companyId,
+            scopeType: policy.scopeType,
+            scopeId: policy.scopeId,
+            thresholdType,
+          }),
+        )
+        .catch((err) => {
+          logger.warn(
+            {
+              err,
+              incidentId: insertedIncident.id,
+              scopeType: policy.scopeType,
+              scopeId: policy.scopeId,
+            },
+            "budget-incident demotion observer failed",
+          );
+        });
+    }
+
+    return insertedIncident;
   }
 
   async function resolveOpenSoftIncidents(policyId: string) {
