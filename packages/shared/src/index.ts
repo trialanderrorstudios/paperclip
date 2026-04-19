@@ -475,6 +475,20 @@ export type {
   AutonomyActivityAction,
 } from "./types/autonomy.js";
 
+// NEW 3 V1 (-tne): autonomy permissions family.
+export {
+  AUTONOMY_ACTIONS,
+  resolveBoardTier,
+  canPerformAutonomyAction,
+  canPromoteAgent,
+  canDemoteAgent,
+  canEditAllowlist,
+  canSetCompanyFloor,
+  canAgentProposeOwnPromotion,
+  type AutonomyAction,
+  type BoardTier,
+} from "./permissions/index.js";
+
 export {
   createCompanySchema,
   updateCompanySchema,
