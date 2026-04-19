@@ -49,6 +49,8 @@ export function companyService(db: Db) {
     feedbackDataSharingTermsVersion: companies.feedbackDataSharingTermsVersion,
     brandColor: companies.brandColor,
     logoAssetId: companyLogos.assetId,
+    // NEW 3 V1 (-tne): per-company autonomy floor.
+    autonomyPolicy: companies.autonomyPolicy,
     createdAt: companies.createdAt,
     updatedAt: companies.updatedAt,
   };

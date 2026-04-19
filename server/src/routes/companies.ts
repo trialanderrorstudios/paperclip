@@ -11,6 +11,9 @@ import {
   feedbackVoteValueSchema,
   updateCompanyBrandingSchema,
   updateCompanySchema,
+  // NEW 3 V1 (-tne): board-tier gate on autonomy_policy edits.
+  resolveBoardTier,
+  canSetCompanyFloor,
 } from "@paperclipai/shared";
 import { badRequest, forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
@@ -321,6 +324,22 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     } else {
       assertBoard(req);
       body = updateCompanySchema.parse(req.body);
+
+      // NEW 3 V1 (-tne): only board_owner may set/modify autonomy_policy.
+      // Any board_member/observer attempt returns 403.
+      if (body.autonomyPolicy !== undefined) {
+        let membershipRole: string | null = null;
+        if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) {
+          membershipRole = "owner";
+        } else if (Array.isArray(req.actor.memberships)) {
+          membershipRole =
+            req.actor.memberships.find((m) => m.companyId === companyId)?.membershipRole ?? null;
+        }
+        const tier = resolveBoardTier(membershipRole);
+        if (!canSetCompanyFloor(tier)) {
+          throw forbidden(`tier ${tier} may not set company autonomy policy`);
+        }
+      }
 
       if (body.feedbackDataSharingEnabled === true && !existingCompany.feedbackDataSharingEnabled) {
         body = {

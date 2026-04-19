@@ -22,6 +22,13 @@ import {
   updateAgentInstructionsPathSchema,
   wakeAgentSchema,
   updateAgentSchema,
+  // NEW 3 V1 (-tne): autonomy helpers used by the PATCH interceptor.
+  type AutonomyLevel,
+  type AllowlistEnvelope,
+  resolveBoardTier,
+  canEditAllowlist,
+  isAutonomyDemotion,
+  isValidPromotionStep,
 } from "@paperclipai/shared";
 import {
   readPaperclipSkillSyncPreference,
@@ -44,6 +51,14 @@ import {
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
 } from "../services/index.js";
+// NEW 3 V1 (-tne): autonomy state machine + compat shim helpers.
+import {
+  autonomyStateMachine,
+  effectiveAutonomyLevel,
+  resolveCompanyMaxLevel,
+  capToCompanyFloor,
+  AutonomyStateMachineError,
+} from "../services/autonomy-state-machine.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import {
@@ -195,6 +210,167 @@ export function agentRoutes(db: Db) {
       chainOfCommand,
       access: accessState,
     };
+  }
+
+  // NEW 3 V1 (-tne): state machine bound to the current db handle.
+  const autonomySM = autonomyStateMachine(db);
+
+  /**
+   * Resolve the board tier for the requesting user against a specific
+   * company. Returns a `membershipRole` string suitable for passing into
+   * `resolveBoardTier()`. Returns null for agent / local-implicit actors.
+   */
+  function resolveActorMembershipRoleForCompany(req: Request, companyId: string): string | null {
+    if (req.actor.type !== "board") return null;
+    if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return "owner";
+    const memberships = Array.isArray(req.actor.memberships) ? req.actor.memberships : [];
+    const m = memberships.find((entry) => entry.companyId === companyId);
+    return m?.membershipRole ?? null;
+  }
+
+  /**
+   * Intercept NEW 3 autonomy fields on a PATCH body and apply them via
+   * the state machine. Returns the count of autonomy mutations applied
+   * so the caller can decide whether to still run the legacy update.
+   * On agent-auth paths, promotions create an `autonomy.promotion`
+   * approval row instead of writing directly.
+   */
+  async function applyAutonomyPatch(
+    req: Request,
+    res: Response,
+    existing: { id: string; companyId: string; role: string; permissions: unknown },
+    body: Record<string, unknown>,
+  ): Promise<{ handled: boolean; error?: true }> {
+    const hasLevel = hasOwn(body, "autonomyLevel");
+    const hasAllowlist = hasOwn(body, "allowlist");
+    if (!hasLevel && !hasAllowlist) return { handled: false };
+
+    const targetLevel = body.autonomyLevel as AutonomyLevel | undefined;
+    const allowlist = body.allowlist as AllowlistEnvelope | undefined;
+    const reason = typeof body.autonomyReason === "string" ? body.autonomyReason : undefined;
+    const currentLevel = effectiveAutonomyLevel(existing.permissions, existing.role);
+
+    // Verify company-floor cap before anything.
+    if (hasLevel && targetLevel) {
+      const companyRow = await db
+        .select({
+          autonomyPolicy: companies.autonomyPolicy,
+          requireBoardApprovalForNewAgents: companies.requireBoardApprovalForNewAgents,
+        })
+        .from(companies)
+        .where(eq(companies.id, existing.companyId))
+        .then((rows) => rows[0] ?? null);
+      const floor = resolveCompanyMaxLevel(
+        companyRow?.autonomyPolicy ?? {},
+        companyRow?.requireBoardApprovalForNewAgents ?? true,
+      );
+      const capped = capToCompanyFloor(targetLevel, floor);
+      if (capped !== targetLevel) {
+        res.status(422).json({
+          error: `target level ${targetLevel} exceeds company floor ${floor}`,
+        });
+        return { handled: true, error: true };
+      }
+    }
+
+    // Agent-auth promotions: create approval row; no direct write.
+    if (req.actor.type === "agent") {
+      if (!hasLevel || !targetLevel) {
+        res.status(422).json({
+          error: "agents may only submit autonomyLevel changes (allowlist edits require board auth)",
+        });
+        return { handled: true, error: true };
+      }
+      const actorAgentId = req.actor.agentId ?? null;
+      if (!actorAgentId || actorAgentId !== existing.id) {
+        res.status(403).json({ error: "agents may only propose their own autonomy changes" });
+        return { handled: true, error: true };
+      }
+      if (!isValidPromotionStep(currentLevel, targetLevel)) {
+        res.status(422).json({
+          error: `invalid promotion step ${currentLevel} → ${targetLevel}`,
+        });
+        return { handled: true, error: true };
+      }
+      try {
+        await autonomySM.createPromotionProposal({
+          agentId: existing.id,
+          companyId: existing.companyId,
+          fromLevel: currentLevel,
+          toLevel: targetLevel,
+          actor: { actorType: "agent", actorId: actorAgentId },
+          justification: reason,
+        });
+      } catch (err) {
+        if (err instanceof AutonomyStateMachineError) {
+          res.status(422).json({ error: err.message, code: err.code });
+          return { handled: true, error: true };
+        }
+        throw err;
+      }
+      return { handled: true };
+    }
+
+    // Board-auth path.
+    const membershipRole = resolveActorMembershipRoleForCompany(req, existing.companyId);
+    const tier = resolveBoardTier(membershipRole);
+    const isCeoAgent = existing.role === "ceo";
+
+    try {
+      if (hasLevel && targetLevel && targetLevel !== currentLevel) {
+        if (isAutonomyDemotion(currentLevel, targetLevel)) {
+          await autonomySM.demote({
+            agentId: existing.id,
+            targetLevel,
+            reason: "manual",
+            actor: { actorType: "user", actorId: req.actor.userId ?? "board", membershipRole, resolvedTier: tier },
+            note: reason,
+          });
+        } else {
+          await autonomySM.promote({
+            agentId: existing.id,
+            targetLevel,
+            actor: { actorType: "user", actorId: req.actor.userId ?? "board", membershipRole, resolvedTier: tier },
+            justification: reason,
+          });
+        }
+      }
+      if (hasAllowlist && allowlist !== undefined) {
+        if (!canEditAllowlist(tier, { isCeoAgent })) {
+          res.status(403).json({ error: `tier ${tier} may not edit this allowlist` });
+          return { handled: true, error: true };
+        }
+        // Write allowlist directly onto permissions jsonb — a simple
+        // merge preserves other permission keys (e.g. canCreateAgents).
+        const currentPermissions =
+          existing.permissions && typeof existing.permissions === "object" && !Array.isArray(existing.permissions)
+            ? { ...(existing.permissions as Record<string, unknown>) }
+            : {};
+        currentPermissions.allowlist = allowlist;
+        await db
+          .update(agentsTable)
+          .set({ permissions: currentPermissions, updatedAt: new Date() })
+          .where(eq(agentsTable.id, existing.id));
+        await logActivity(db, {
+          companyId: existing.companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          agentId: existing.id,
+          action: "agent.allowlist_updated",
+          entityType: "agent",
+          entityId: existing.id,
+          details: { actorRoleAtTime: tier, allowlist },
+        });
+      }
+    } catch (err) {
+      if (err instanceof AutonomyStateMachineError) {
+        const status = err.code === "forbidden" ? 403 : 422;
+        res.status(status).json({ error: err.message, code: err.code });
+        return { handled: true, error: true };
+      }
+      throw err;
+    }
+    return { handled: true };
   }
 
   async function applyDefaultAgentTaskAssignGrant(
@@ -1370,6 +1546,10 @@ export function agentRoutes(db: Db) {
       desiredSkills: requestedDesiredSkills,
       sourceIssueId: _sourceIssueId,
       sourceIssueIds: _sourceIssueIds,
+      // NEW 3 V1 (-tne): extract autonomy initial values — they ride on
+      // `permissions` jsonb, not as top-level agent columns.
+      initialAutonomyLevel: requestedInitialAutonomyLevel,
+      initialAllowlist: requestedInitialAllowlist,
       ...hireInput
     } = req.body;
     hireInput.adapterType = assertKnownAdapterType(hireInput.adapterType);
@@ -1419,8 +1599,30 @@ export function agentRoutes(db: Db) {
 
     const requiresApproval = company.requireBoardApprovalForNewAgents;
     const status = requiresApproval ? "pending_approval" : "idle";
+
+    // NEW 3 V1 (-tne): compose permissions jsonb with requested initial
+    // autonomy level + allowlist, capped by company floor. Falls back to
+    // role default when level omitted (plan §6.1).
+    const companyFloor = resolveCompanyMaxLevel(
+      company.autonomyPolicy ?? {},
+      company.requireBoardApprovalForNewAgents,
+    );
+    const basePermissions =
+      normalizedHireInput.permissions && typeof normalizedHireInput.permissions === "object"
+        ? { ...(normalizedHireInput.permissions as Record<string, unknown>) }
+        : {};
+    if (requestedInitialAutonomyLevel) {
+      const capped = capToCompanyFloor(requestedInitialAutonomyLevel, companyFloor);
+      basePermissions.autonomyLevel = capped;
+    }
+    if (requestedInitialAllowlist) {
+      basePermissions.allowlist = requestedInitialAllowlist;
+    }
+    const composedPermissions = Object.keys(basePermissions).length > 0 ? basePermissions : undefined;
+
     const createdAgent = await svc.create(companyId, {
       ...normalizedHireInput,
+      permissions: composedPermissions,
       status,
       spentMonthlyCents: 0,
       lastHeartbeatAt: null,
@@ -1936,6 +2138,24 @@ export function agentRoutes(db: Db) {
     const patchData = { ...(req.body as Record<string, unknown>) };
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;
+
+    // NEW 3 V1 (-tne): intercept autonomy fields BEFORE the legacy update
+    // path. On success, strip them from patchData so the existing flow
+    // doesn't see them and svc.update() (which zod-unknown-field-strips
+    // inside) stays clean.
+    const autonomyResult = await applyAutonomyPatch(req, res, existing, patchData);
+    if (autonomyResult.error) return;
+    if (autonomyResult.handled) {
+      delete patchData.autonomyLevel;
+      delete patchData.allowlist;
+      delete patchData.autonomyReason;
+      // If the only fields on the patch were autonomy fields, early-exit.
+      if (Object.keys(patchData).length === 0) {
+        const refreshed = await svc.getById(id);
+        res.json(refreshed ?? existing);
+        return;
+      }
+    }
     if (hasOwn(patchData, "adapterConfig")) {
       const adapterConfig = asRecord(patchData.adapterConfig);
       if (!adapterConfig) {

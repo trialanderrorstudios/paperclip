@@ -7,6 +7,8 @@ import {
 } from "../constants.js";
 import { agentAdapterTypeSchema } from "../adapter-type.js";
 import { envConfigSchema } from "./secret.js";
+// NEW 3 V1 (-tne): allow autonomy fields through the PATCH validator.
+import { autonomyLevelSchema, allowlistEnvelopeSchema } from "./autonomy.js";
 
 export const agentPermissionsSchema = z.object({
   canCreateAgents: z.boolean().optional().default(false),
@@ -65,6 +67,10 @@ export type CreateAgent = z.infer<typeof createAgentSchema>;
 export const createAgentHireSchema = createAgentSchema.extend({
   sourceIssueId: z.string().uuid().optional().nullable(),
   sourceIssueIds: z.array(z.string().uuid()).optional(),
+  // NEW 3 V1 (-tne): optional initial autonomy fields at hire time.
+  // Falls back to role defaults ∩ company floor when absent (plan §6.1).
+  initialAutonomyLevel: autonomyLevelSchema.optional(),
+  initialAllowlist: allowlistEnvelopeSchema.optional(),
 });
 
 export type CreateAgentHire = z.infer<typeof createAgentHireSchema>;
@@ -77,6 +83,13 @@ export const updateAgentSchema = createAgentSchema
     replaceAdapterConfig: z.boolean().optional(),
     status: z.enum(AGENT_STATUSES).optional(),
     spentMonthlyCents: z.number().int().nonnegative().optional(),
+    // NEW 3 V1 (-tne): graduated autonomy — top-level fields that the
+    // PATCH handler interprets via the state machine. Mirrors the split
+    // used for `permissions` (PATCH /agents/:id/permissions) so the
+    // existing rejection-on-permissions invariant is preserved.
+    autonomyLevel: autonomyLevelSchema.optional(),
+    allowlist: allowlistEnvelopeSchema.optional(),
+    autonomyReason: z.string().trim().min(1).max(500).optional(),
   });
 
 export type UpdateAgent = z.infer<typeof updateAgentSchema>;

@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { COMPANY_STATUSES } from "../constants.js";
+// NEW 3 V1 (-tne): per-company autonomy floor.
+import { autonomyPolicySchema } from "./autonomy.js";
 
 const logoAssetIdSchema = z.string().uuid().nullable().optional();
 const brandColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/).nullable().optional();
@@ -25,6 +27,9 @@ export const updateCompanySchema = createCompanySchema
     feedbackDataSharingTermsVersion: feedbackDataSharingTermsVersionSchema,
     brandColor: brandColorSchema,
     logoAssetId: logoAssetIdSchema,
+    // NEW 3 V1 (-tne): per-company autonomy floor. Only board_owner may
+    // set this — handler gates via canSetCompanyFloor(tier).
+    autonomyPolicy: autonomyPolicySchema.optional(),
   });
 
 export type UpdateCompany = z.infer<typeof updateCompanySchema>;
