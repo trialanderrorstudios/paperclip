@@ -156,6 +156,55 @@ export function approvalRoutes(db: Db) {
         },
       });
 
+      // NEW 3 V1 (-tne) Gap 3: autonomy-specific activity emitters.
+      // When an `autonomy.promotion` or `allowlist.exception` approval
+      // resolves to approved, emit the autonomy-ladder activity row so
+      // the Overwatch-v3 board UI can surface it in the agent's
+      // promotion/violation timeline. Note: the state-machine mutation
+      // for `autonomy.promotion` (calling sm.promote) is a separate
+      // wiring concern intentionally NOT done here — this commit is
+      // scoped to emitters only. `autonomy.promoted` is already emitted
+      // by the state machine when that wiring lands (V1.1).
+      if (approval.type === "autonomy.promotion") {
+        await logActivity(db, {
+          companyId: approval.companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          agentId:
+            typeof approval.payload === "object" && approval.payload !== null
+              ? ((approval.payload as Record<string, unknown>).agentId as
+                  | string
+                  | undefined) ?? approval.requestedByAgentId ?? null
+              : approval.requestedByAgentId ?? null,
+          action: "autonomy.proposal.approved",
+          entityType: "approval",
+          entityId: approval.id,
+          details: {
+            requestedByAgentId: approval.requestedByAgentId,
+            payload: approval.payload,
+          },
+        });
+      } else if (approval.type === "allowlist.exception") {
+        await logActivity(db, {
+          companyId: approval.companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          agentId:
+            typeof approval.payload === "object" && approval.payload !== null
+              ? ((approval.payload as Record<string, unknown>).agentId as
+                  | string
+                  | undefined) ?? approval.requestedByAgentId ?? null
+              : approval.requestedByAgentId ?? null,
+          action: "allowlist.exception.approved",
+          entityType: "approval",
+          entityId: approval.id,
+          details: {
+            requestedByAgentId: approval.requestedByAgentId,
+            payload: approval.payload,
+          },
+        });
+      }
+
       if (approval.requestedByAgentId) {
         try {
           const wakeRun = await heartbeat.wakeup(approval.requestedByAgentId, {
