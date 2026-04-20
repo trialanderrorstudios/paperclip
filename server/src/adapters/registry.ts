@@ -55,6 +55,14 @@ import {
   agentConfigurationDoc as openclawGatewayAgentConfigurationDoc,
   models as openclawGatewayModels,
 } from "@paperclipai/adapter-openclaw-gateway";
+import {
+  execute as claudebridgeExecute,
+  testEnvironment as claudebridgeTestEnvironment,
+} from "@paperclipai/adapter-claudebridge-local/server";
+import {
+  agentConfigurationDoc as claudebridgeAgentConfigurationDoc,
+  models as claudebridgeModels,
+} from "@paperclipai/adapter-claudebridge-local";
 import { listCodexModels } from "./codex-models.js";
 import { listCursorModels } from "./cursor-models.js";
 import {
@@ -166,6 +174,17 @@ const openclawGatewayAdapter: ServerAdapterModule = {
   agentConfigurationDoc: openclawGatewayAgentConfigurationDoc,
 };
 
+const claudebridgeLocalAdapter: ServerAdapterModule = {
+  type: "claudebridge_local",
+  execute: claudebridgeExecute,
+  testEnvironment: claudebridgeTestEnvironment,
+  models: claudebridgeModels,
+  supportsLocalAgentJwt: false,
+  supportsInstructionsBundle: false,
+  requiresMaterializedRuntimeSkills: false,
+  agentConfigurationDoc: claudebridgeAgentConfigurationDoc,
+};
+
 const openCodeLocalAdapter: ServerAdapterModule = {
   type: "opencode_local",
   execute: openCodeExecute,
@@ -230,6 +249,7 @@ const pausedOverrides = new Set<string>();
 function registerBuiltInAdapters() {
   for (const adapter of [
     claudeLocalAdapter,
+    claudebridgeLocalAdapter,
     codexLocalAdapter,
     openCodeLocalAdapter,
     piLocalAdapter,
