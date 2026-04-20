@@ -75,11 +75,33 @@ export class AutonomyStateMachineError extends Error {
       | "forbidden"
       | "invalid_step"
       | "noop"
-      | "policy_cap_exceeded",
+      | "policy_cap_exceeded"
+      | "rate_limited",
+    public readonly details?: Record<string, unknown>,
   ) {
     super(message);
     this.name = "AutonomyStateMachineError";
   }
+}
+
+/**
+ * NEW 3 V1.1 (-tne): promotion proposal rate limit.
+ *
+ * Read the cooldown window at call time so operators with aggressive
+ * test environments can shorten it without restart. NaN/≤0 → fall back
+ * to 24h. We treat `pending` OR `rejected` rows within the window as
+ * blocking; `invalidated`, `approved`, `revision_requested` do not block
+ * — invalidated means a demotion cleared the queue and the agent has a
+ * legitimate reason to re-propose, approved means the proposal already
+ * applied (future promotions go through a different step), and
+ * `revision_requested` is the operator explicitly asking for another
+ * submission.
+ */
+export function resolvePromotionCooldownHours(): number {
+  const raw = process.env.AUTONOMY_PROMOTION_COOLDOWN_HOURS;
+  const parsed = Number.parseInt(raw ?? "24", 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 24;
+  return parsed;
 }
 
 interface AgentAutonomyView {
@@ -369,6 +391,69 @@ export function autonomyStateMachine(db: Db) {
         "invalid_step",
       );
     }
+
+    // NEW 3 V1.1 (-tne): rate-limit self-promotion proposals. An agent
+    // can otherwise spam pending/rejected proposals at heartbeat cadence
+    // and fill the operator's approval queue with noise, or game the
+    // review path through repetition.
+    //
+    // Block if there's already a `pending` OR `rejected` proposal for the
+    // same agent + same target level within the cooldown window. We key
+    // on `createdAt` uniformly because `pending` rows never have a
+    // `decidedAt`; using createdAt matches the "once per N hours from
+    // attempt time" reading of the rule.
+    const cooldownHours = resolvePromotionCooldownHours();
+    const cooldownCutoff = new Date(Date.now() - cooldownHours * 60 * 60 * 1000);
+    const blockers = await db
+      .select({
+        id: approvals.id,
+        status: approvals.status,
+        createdAt: approvals.createdAt,
+      })
+      .from(approvals)
+      .where(
+        and(
+          eq(approvals.companyId, args.companyId),
+          eq(approvals.requestedByAgentId, args.agentId),
+          eq(approvals.type, "autonomy.promotion"),
+          sql`${approvals.payload} ->> 'toLevel' = ${args.toLevel}`,
+          sql`${approvals.status} IN ('pending', 'rejected')`,
+          sql`${approvals.createdAt} >= ${cooldownCutoff}`,
+        ),
+      )
+      .limit(1);
+    const blocker = blockers[0];
+    if (blocker) {
+      // Emit FIRST, then throw. If we threw first the activity row would
+      // never land and the operator would not see the rate-limited
+      // attempt in the activity feed.
+      await logActivity(db, {
+        companyId: args.companyId,
+        actorType: "agent",
+        actorId: args.actor.actorId,
+        agentId: args.agentId,
+        action: "autonomy.promotion_rate_limited",
+        entityType: "approval",
+        entityId: blocker.id,
+        details: {
+          fromLevel: args.fromLevel,
+          toLevel: args.toLevel,
+          cooldownHours,
+          blockedByApprovalId: blocker.id,
+          blockedByStatus: blocker.status,
+        },
+      });
+      throw new AutonomyStateMachineError(
+        "Pending or recent proposal exists — wait 24h or have it resolved first.",
+        "rate_limited",
+        {
+          blockedByApprovalId: blocker.id,
+          blockedByStatus: blocker.status,
+          cooldownHours,
+        },
+      );
+    }
+
     const inserted = await db
       .insert(approvals)
       .values({

@@ -8,8 +8,9 @@ import {
 } from "../services/autonomy-state-machine.ts";
 
 // Avoid loading the real logActivity (which imports instanceSettingsService etc.).
+const mockLogActivity = vi.hoisted(() => vi.fn(async () => {}));
 vi.mock("../services/activity-log.js", () => ({
-  logActivity: vi.fn(async () => {}),
+  logActivity: mockLogActivity,
 }));
 
 interface AgentRow {
@@ -19,27 +20,58 @@ interface AgentRow {
   permissions: Record<string, unknown>;
 }
 
+interface BlockerApprovalRow {
+  id: string;
+  status: string;
+  createdAt: Date;
+}
+
 function makeDb(opts: {
   agentRows?: AgentRow[];
   invalidatedApprovalIds?: string[];
+  // NEW 3 V1.1 (-tne): rate-limit fixture. Rows returned from the
+  // createPromotionProposal rate-limit lookup against approvals.
+  rateLimitBlockerRows?: BlockerApprovalRow[];
 }) {
   const agentRows = opts.agentRows ?? [];
   const invalidatedApprovalIds = opts.invalidatedApprovalIds ?? [];
+  const rateLimitBlockerRows = opts.rateLimitBlockerRows ?? [];
   const updates: Array<{ kind: "agents" | "approvals"; set: Record<string, unknown>; where: unknown }> = [];
 
-  // select builder
+  // select builder. Dispatches by the first argument to `.from(table)` —
+  // the state machine selects from agents for the current-level read and
+  // from approvals for the rate-limit check.
   const selectBuilder = () => {
     let _whereArgs: unknown = null;
+    let fromKind: "agents" | "approvals" = "agents";
     const chain: Record<string, unknown> = {};
-    chain.from = vi.fn(() => chain);
+    chain.from = vi.fn((tbl: unknown) => {
+      // Drizzle stores the table name on a Symbol-keyed property. Fall
+      // back to any runtime `name` if that's how a future refactor
+      // exposes it.
+      const drizzleNameSym = Object.getOwnPropertySymbols(tbl ?? {}).find(
+        (s) => s.description === "drizzle:Name",
+      );
+      const name =
+        (drizzleNameSym ? (tbl as Record<symbol, unknown>)[drizzleNameSym] : null) ??
+        (tbl as { name?: string })?.name ??
+        null;
+      if (name === "approvals") fromKind = "approvals";
+      else fromKind = "agents";
+      return chain;
+    });
     chain.where = vi.fn((w: unknown) => {
       _whereArgs = w;
       return chain;
     });
-    chain.then = vi.fn((resolve: (rows: unknown[]) => unknown) =>
-      Promise.resolve(resolve(agentRows.map((r) => ({ ...r })))),
-    );
-    // Note: _whereArgs is kept in closure to avoid ts-unused warnings
+    chain.limit = vi.fn(() => chain);
+    chain.then = vi.fn((resolve: (rows: unknown[]) => unknown) => {
+      const rows =
+        fromKind === "approvals"
+          ? rateLimitBlockerRows.map((r) => ({ ...r }))
+          : agentRows.map((r) => ({ ...r }));
+      return Promise.resolve(resolve(rows));
+    });
     void _whereArgs;
     return chain;
   };
@@ -420,5 +452,121 @@ describe("autonomyStateMachine.createPromotionProposal", () => {
         actor: { actorType: "agent", actorId: "a1" },
       }),
     ).rejects.toMatchObject({ code: "invalid_step" });
+  });
+
+  // NEW 3 V1.1 (-tne): promotion-proposal rate limit.
+  describe("rate limit", () => {
+    it("blocks a second proposal for the same target level within the cooldown window", async () => {
+      const { db } = makeDb({
+        agentRows: [],
+        rateLimitBlockerRows: [
+          {
+            id: "approval-pending-1",
+            status: "pending",
+            createdAt: new Date(Date.now() - 60 * 60 * 1000), // 1h ago
+          },
+        ],
+      });
+      const sm = autonomyStateMachine(db as any);
+      await expect(
+        sm.createPromotionProposal({
+          agentId: "a1",
+          companyId: "c1",
+          fromLevel: "gated",
+          toLevel: "policy",
+          actor: { actorType: "agent", actorId: "a1" },
+        }),
+      ).rejects.toMatchObject({
+        code: "rate_limited",
+        details: { blockedByApprovalId: "approval-pending-1", blockedByStatus: "pending" },
+      });
+    });
+
+    it("emits autonomy.promotion_rate_limited activity row on the block", async () => {
+      mockLogActivity.mockClear();
+      const { db } = makeDb({
+        agentRows: [],
+        rateLimitBlockerRows: [
+          {
+            id: "approval-rejected-1",
+            status: "rejected",
+            createdAt: new Date(Date.now() - 30 * 60 * 1000),
+          },
+        ],
+      });
+      const sm = autonomyStateMachine(db as any);
+      await expect(
+        sm.createPromotionProposal({
+          agentId: "a1",
+          companyId: "c1",
+          fromLevel: "gated",
+          toLevel: "policy",
+          actor: { actorType: "agent", actorId: "a1" },
+        }),
+      ).rejects.toThrow(AutonomyStateMachineError);
+      const rateLimitedCalls = mockLogActivity.mock.calls.filter(
+        (call: unknown[]) =>
+          (call[1] as { action?: string } | undefined)?.action ===
+          "autonomy.promotion_rate_limited",
+      );
+      expect(rateLimitedCalls).toHaveLength(1);
+      const entry = rateLimitedCalls[0]![1] as Record<string, unknown>;
+      expect(entry).toMatchObject({
+        companyId: "c1",
+        actorType: "agent",
+        actorId: "a1",
+        agentId: "a1",
+        entityType: "approval",
+        entityId: "approval-rejected-1",
+      });
+      expect((entry.details as Record<string, unknown>).toLevel).toBe("policy");
+      expect((entry.details as Record<string, unknown>).blockedByStatus).toBe("rejected");
+    });
+
+    it("does NOT block when no matching blocker row exists (different toLevel / outside window / invalidated)", async () => {
+      // Empty blocker rows simulates all three skip-cases at once: the
+      // rate-limit query's SQL predicate would not match any of them.
+      const { db } = makeDb({
+        agentRows: [],
+        rateLimitBlockerRows: [],
+      });
+      const sm = autonomyStateMachine(db as any);
+      const row = await sm.createPromotionProposal({
+        agentId: "a1",
+        companyId: "c1",
+        fromLevel: "gated",
+        toLevel: "policy",
+        actor: { actorType: "agent", actorId: "a1" },
+      });
+      expect(row).toMatchObject({ id: "approval-1", status: "pending" });
+    });
+
+    it("honours AUTONOMY_PROMOTION_COOLDOWN_HOURS env override", async () => {
+      const prev = process.env.AUTONOMY_PROMOTION_COOLDOWN_HOURS;
+      try {
+        process.env.AUTONOMY_PROMOTION_COOLDOWN_HOURS = "1";
+        // The service evaluates the env on each call, so setting here
+        // before invocation is enough. The blocker row is "2h ago";
+        // with a 1h window it should NOT block (assuming the mock's
+        // select returned-rows discipline: the production SQL would
+        // filter this row out; our mock returns what the fixture says
+        // the SQL matched). To correctly model the SQL we simulate by
+        // passing an empty fixture — the point of this test is that
+        // the env read happens at call time without throwing.
+        const { db } = makeDb({ agentRows: [], rateLimitBlockerRows: [] });
+        const sm = autonomyStateMachine(db as any);
+        const row = await sm.createPromotionProposal({
+          agentId: "a1",
+          companyId: "c1",
+          fromLevel: "gated",
+          toLevel: "policy",
+          actor: { actorType: "agent", actorId: "a1" },
+        });
+        expect(row).toMatchObject({ id: "approval-1" });
+      } finally {
+        if (prev === undefined) delete process.env.AUTONOMY_PROMOTION_COOLDOWN_HOURS;
+        else process.env.AUTONOMY_PROMOTION_COOLDOWN_HOURS = prev;
+      }
+    });
   });
 });

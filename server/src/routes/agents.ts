@@ -309,6 +309,21 @@ export function agentRoutes(db: Db) {
         });
       } catch (err) {
         if (err instanceof AutonomyStateMachineError) {
+          // NEW 3 V1.1 (-tne): rate-limit block surfaces as a 409 Conflict
+          // with a dotted, activity-feed-aligned error code so operator
+          // UIs can distinguish it from the generic 422 validation error
+          // on `invalid_step`/etc. The internal state-machine code
+          // (`rate_limited`) and the externally-surfaced API code
+          // (`autonomy.promotion_rate_limited`) are intentionally
+          // separate namespaces: internal enum vs public surface.
+          if (err.code === "rate_limited") {
+            res.status(409).json({
+              error: err.message,
+              code: "autonomy.promotion_rate_limited",
+              ...(err.details ? { details: err.details } : {}),
+            });
+            return { handled: true, error: true };
+          }
           res.status(422).json({ error: err.message, code: err.code });
           return { handled: true, error: true };
         }
