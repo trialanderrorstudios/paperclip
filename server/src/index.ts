@@ -645,6 +645,24 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "periodic heartbeat recovery failed");
         });
+
+      // NEW 3 V1.1 (-tne): heartbeat-staleness auto-demote. A disconnected
+      // autopilot agent keeps its permissions forever today; this pass
+      // demotes one step (autopilot → policy → gated) when an agent's
+      // lastHeartbeatAt is older than max(intervalSec*3, 30min). Wired
+      // into the same tick as reapOrphanedRuns because they share the
+      // same "stale agent" signal and `tickTimers` is the natural place
+      // for periodic agent-scoped checks.
+      void heartbeat
+        .demoteStaleHeartbeats(new Date())
+        .then((result) => {
+          if (result.demoted > 0) {
+            logger.warn({ ...result }, "heartbeat-staleness auto-demote pass");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "heartbeat-staleness auto-demote failed");
+        });
     }, config.heartbeatSchedulerIntervalMs);
   }
   

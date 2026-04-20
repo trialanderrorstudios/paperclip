@@ -42,6 +42,11 @@ import {
 } from "./heartbeat-run-summary.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import {
+  autonomyStateMachine,
+  effectiveAutonomyLevel,
+} from "./autonomy-state-machine.js";
+import type { AutonomyLevel } from "@paperclipai/shared";
+import {
   buildAdapterContextScope,
   AdapterContextScopeError,
 } from "./adapter-context-scope.js";
@@ -98,6 +103,14 @@ const ORPHAN_RESILIENCE_WINDOW_MS = 2 * 60 * 60 * 1000;
 // NEW 0-B-11 (-tne): grace period between SIGTERM and SIGKILL when forcibly
 // killing a run's child process via killRunProcess().
 const KILL_RUN_FORCE_AFTER_MS = 5_000;
+// NEW 3 V1.1 (-tne): floor under the heartbeat-staleness auto-demote
+// threshold. An agent with an unusually long intervalSec (e.g. a weekly
+// beat) would otherwise have a many-days grace window before we'd demote,
+// which defeats the point of demoting on a disconnected autopilot.
+// Clamp to max(intervalSec * 3, 30min) so the staleness trigger stays
+// sharp-enough to matter without falsely demoting healthy short-beat
+// agents that happened to miss a tick.
+const HEARTBEAT_STALE_DEMOTE_FLOOR_MS = 30 * 60 * 1000;
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -5346,6 +5359,107 @@ export function heartbeatService(db: Db) {
     await cancelPendingWakeupsForBudgetScope(scope);
   }
 
+  /**
+   * NEW 3 V1.1 (-tne): heartbeat-staleness auto-demote (plan §A1, deferred
+   * from NEW 3 V1 and referenced in the `autonomy-state-machine.ts` TODO
+   * at the bottom of the file).
+   *
+   * Today a disconnected autopilot agent keeps its permissions forever.
+   * Once per tick, walk active agents and demote one step (autopilot →
+   * policy → gated) if:
+   *   - status is not paused/terminated/pending_approval
+   *   - heartbeat is enabled with intervalSec > 0
+   *   - current autonomy level is policy or autopilot (gated is already
+   *     the floor, can't go lower)
+   *   - lastHeartbeatAt is set (never demote on missing signal — a brand
+   *     new agent that hasn't heartbeat yet is "no signal", not stale;
+   *     tickTimers handles the null case by scheduling the first beat,
+   *     not by demoting)
+   *   - elapsed time since lastHeartbeatAt exceeds
+   *     `max(intervalSec * 3, HEARTBEAT_STALE_DEMOTE_FLOOR_MS)`
+   *
+   * Re-uses `autonomyStateMachine.demote()` so we pick up:
+   *   - the SQL rank-guard (safe under concurrent demotion triggers)
+   *   - pending-promotion-proposal invalidation
+   *   - the canonical `autonomy.demoted` activity_log row
+   *
+   * The typed `reason` field on the state machine only knows the enum
+   * `adapter_timeout`; the spec's `heartbeat-staleness` prose lands in
+   * `note` along with the stale lastHeartbeatAt so operators reading
+   * details.note can see which trigger fired and how late the beat was.
+   *
+   * "Don't double-demote on the same check pass" is naturally satisfied
+   * because each agent is visited once per iteration. The SQL rank-guard
+   * on `sm.demote()` prevents a concurrent second trigger (e.g. budget
+   * incident) from racing us into the same slot.
+   */
+  async function demoteStaleHeartbeats(now = new Date()) {
+    const allAgents = await db.select().from(agents);
+    const sm = autonomyStateMachine(db);
+    let checked = 0;
+    let demoted = 0;
+    let skipped = 0;
+
+    for (const agent of allAgents) {
+      if (
+        agent.status === "paused" ||
+        agent.status === "terminated" ||
+        agent.status === "pending_approval"
+      ) {
+        continue;
+      }
+
+      const policy = parseHeartbeatPolicy(agent);
+      if (!policy.enabled || policy.intervalSec <= 0) continue;
+
+      const currentLevel = effectiveAutonomyLevel(agent.permissions, agent.role);
+      if (currentLevel === "gated") continue; // already at the floor
+
+      // Missing lastHeartbeatAt = no signal yet, NOT stale. A just-created
+      // autopilot agent shouldn't be demoted before its first heartbeat.
+      if (!agent.lastHeartbeatAt) continue;
+
+      checked += 1;
+
+      const lastBeatMs = new Date(agent.lastHeartbeatAt).getTime();
+      const elapsedMs = now.getTime() - lastBeatMs;
+      const thresholdMs = Math.max(
+        policy.intervalSec * 3 * 1000,
+        HEARTBEAT_STALE_DEMOTE_FLOOR_MS,
+      );
+      if (elapsedMs < thresholdMs) {
+        skipped += 1;
+        continue;
+      }
+
+      const targetLevel: AutonomyLevel = currentLevel === "autopilot" ? "policy" : "gated";
+
+      try {
+        await sm.demote({
+          agentId: agent.id,
+          targetLevel,
+          reason: "adapter_timeout",
+          actor: {
+            actorType: "system",
+            actorId: "heartbeat-staleness-observer",
+          },
+          note: `heartbeat-staleness: lastHeartbeatAt=${new Date(agent.lastHeartbeatAt).toISOString()}, elapsedMs=${elapsedMs}, thresholdMs=${thresholdMs}, intervalSec=${policy.intervalSec}`,
+        });
+        demoted += 1;
+      } catch (err) {
+        logger.warn(
+          { err, agentId: agent.id, fromLevel: currentLevel, toLevel: targetLevel },
+          "heartbeat-staleness demotion failed",
+        );
+      }
+    }
+
+    if (demoted > 0) {
+      logger.warn({ checked, demoted, skipped }, "heartbeat-staleness auto-demote pass");
+    }
+    return { checked, demoted, skipped };
+  }
+
   return {
     list: async (companyId: string, agentId?: string, limit?: number) => {
       const query = db
@@ -5538,6 +5652,8 @@ export function heartbeatService(db: Db) {
     reapOrphanedRuns,
 
     markOrphanedRunsFromRestart,
+
+    demoteStaleHeartbeats,
 
     resumeQueuedRuns,
 
