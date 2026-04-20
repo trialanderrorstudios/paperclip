@@ -2599,6 +2599,16 @@ export function heartbeatService(db: Db) {
       intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
+      // NEW 0-B-8 (-tne): per-agent operator-prompt template for timer
+      // wakes. When an agent (typically a CEO) has heartbeat enabled and
+      // sets a template here, the scheduler writes it to
+      // contextSnapshot.wakeReason so the adapter routes through its
+      // operator-prompt path instead of the stock issue-claim workflow.
+      // Read either runtimeConfig.heartbeat.wakeReasonTemplate (preferred)
+      // or the legacy runtimeConfig.heartbeat.wakePrompt alias.
+      wakeReasonTemplate:
+        readNonEmptyString(heartbeat.wakeReasonTemplate) ??
+        readNonEmptyString(heartbeat.wakePrompt),
     };
   }
 
@@ -5392,6 +5402,23 @@ export function heartbeatService(db: Db) {
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
 
+        // NEW 0-B-8 (-tne): route heartbeat-source timer wakes through
+        // the adapter's operator-prompt path. Adapters (openclaw-gateway,
+        // claudebridge-local) read context.wakeReason as the raw
+        // operator prompt when no issue/task is attached. Without this,
+        // timer wakes either emit empty wake text (claudebridge-local)
+        // or fall into the stock Paperclip issue-claim workflow
+        // (openclaw-gateway). For CEOs with heartbeat enabled, that's
+        // not what we want on every beat.
+        //
+        // Agents can override the prompt via
+        // runtimeConfig.heartbeat.wakeReasonTemplate. The default below
+        // is a lean "check the board, report or delegate" nudge aimed
+        // at CEO-shaped autonomy runs.
+        const heartbeatWakePrompt =
+          policy.wakeReasonTemplate ??
+          "Heartbeat wake. Check your board for new work, review in-flight runs, and either delegate, report, or stand by. No issue is attached — this is a scheduled check-in.";
+
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
           triggerDetail: "system",
@@ -5402,6 +5429,11 @@ export function heartbeatService(db: Db) {
             source: "scheduler",
             reason: "interval_elapsed",
             now: now.toISOString(),
+            // Written explicitly so enrichWakeContextSnapshot() does not
+            // overwrite it with the internal reason code
+            // ("heartbeat_timer"). Adapters pick this up verbatim as the
+            // operator prompt.
+            wakeReason: heartbeatWakePrompt,
           },
         });
         if (run) enqueued += 1;
