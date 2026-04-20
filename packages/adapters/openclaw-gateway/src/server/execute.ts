@@ -363,6 +363,14 @@ function buildWakeText(
   paperclipEnv: Record<string, string>,
   structuredWakePrompt: string,
 ): string {
+  // NEW 0-B-4 (-tne): operator-prompt mode. When there's no issue or
+  // task to execute, just a direct operator prompt (Overwatch-v3
+  // Captain's Desk), skip the Paperclip claim workflow entirely. The
+  // CEO gets the task as-is, no API-key scavenger hunt.
+  if (!payload.taskId && !payload.issueId && payload.wakeReason) {
+    return buildOperatorPromptWakeText(payload, paperclipEnv, structuredWakePrompt);
+  }
+
   const claimedApiKeyPath = "~/.openclaw/workspace/paperclip-claimed-api-key.json";
   const orderedKeys = [
     "PAPERCLIP_RUN_ID",
@@ -440,6 +448,46 @@ function buildWakeText(
     "",
     "Complete the workflow in this run.",
   ];
+  return lines.join("\n");
+}
+
+/**
+ * NEW 0-B-4 (-tne): wake text for operator-prompt mode (no issue/task).
+ * Emitted when the operator taps Wake the Captain in Overwatch-v3 with
+ * a free-form prompt. The CEO gets the prompt as the primary task and
+ * is free to call Paperclip's API if they need it, but is NOT forced
+ * to load an API key or run the checkout workflow first.
+ */
+function buildOperatorPromptWakeText(
+  payload: WakePayload,
+  paperclipEnv: Record<string, string>,
+  structuredWakePrompt: string,
+): string {
+  const lines = [
+    "Operator task from the board (Overwatch-v3 Captain's Desk).",
+    "",
+    "Your task:",
+    payload.wakeReason ?? "",
+    "",
+    "Context (for your records, not a workflow to run):",
+    `PAPERCLIP_RUN_ID=${paperclipEnv.PAPERCLIP_RUN_ID ?? ""}`,
+    `PAPERCLIP_AGENT_ID=${paperclipEnv.PAPERCLIP_AGENT_ID ?? ""}`,
+    `PAPERCLIP_COMPANY_ID=${paperclipEnv.PAPERCLIP_COMPANY_ID ?? ""}`,
+  ];
+  if (paperclipEnv.PAPERCLIP_API_URL) {
+    lines.push(`PAPERCLIP_API_URL=${paperclipEnv.PAPERCLIP_API_URL}`);
+  }
+  lines.push(
+    "",
+    "Rules:",
+    "- Execute the task directly. No issue checkout, no API claim workflow.",
+    "- You do NOT need a PAPERCLIP_API_KEY for this run. Do not search for one.",
+    "- If you need Paperclip state (issues, agents, approvals), those endpoints are available; call them as needed.",
+    "- Report your work as the final assistant message. That's how the operator sees results.",
+  );
+  if (structuredWakePrompt) {
+    lines.push("", structuredWakePrompt);
+  }
   return lines.join("\n");
 }
 
