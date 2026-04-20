@@ -79,6 +79,7 @@ import {
 } from "../adapters/index.js";
 import { redactEventPayload } from "../redaction.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
+import { logger } from "../middleware/logger.js";
 import { renderOrgChartSvg, renderOrgChartPng, type OrgNode, type OrgChartStyle, ORG_CHART_STYLES } from "./org-chart-svg.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
@@ -714,6 +715,35 @@ export function agentRoutes(db: Db) {
     if (disableDeviceAuth) return adapterConfig;
     if (asNonEmptyString(adapterConfig.devicePrivateKeyPem)) return adapterConfig;
     return { ...adapterConfig, devicePrivateKeyPem: generateEd25519PrivateKeyPem() };
+  }
+
+  /**
+   * NEW 0-B-7 (-tne): mint a PAPERCLIP_API_KEY for the newly-hired
+   * agent and write it into adapterConfig.env so the runtime (Claude
+   * CLI, Codex, openclaw-routed adapters) gets it as an env var on
+   * wake. Caller-supplied env.PAPERCLIP_API_KEY wins. Closes over
+   * the outer `svc` + `db`.
+   */
+  async function provisionAgentPaperclipKeyForHire(agent: {
+    id: string;
+    adapterConfig: unknown;
+  }): Promise<void> {
+    const currentConfig = asRecord(agent.adapterConfig) ?? {};
+    const currentEnv = asRecord(currentConfig.env) ?? {};
+    // Caller already supplied a key — respect it.
+    if (
+      currentEnv.PAPERCLIP_API_KEY !== undefined &&
+      currentEnv.PAPERCLIP_API_KEY !== null
+    ) {
+      return;
+    }
+    const key = await svc.createApiKey(agent.id, "primary");
+    const nextEnv = {
+      ...currentEnv,
+      PAPERCLIP_API_KEY: { type: "plain" as const, value: key.token },
+    };
+    const nextAdapterConfig = { ...currentConfig, env: nextEnv };
+    await svc.update(agent.id, { adapterConfig: nextAdapterConfig });
   }
 
   /**
@@ -1714,6 +1744,25 @@ export function agentRoutes(db: Db) {
       lastHeartbeatAt: null,
     });
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent);
+
+    // NEW 0-B-7 (-tne): every fresh hire gets a Paperclip API key minted
+    // and injected into adapterConfig.env.PAPERCLIP_API_KEY on the way
+    // in. Without this, Overwatch-v3 CEOs hiring subordinates via
+    // POST /agent-hires had to chain three calls (hire → POST keys →
+    // PATCH adapterConfig.env) just to give their hires API access.
+    // Now the single hire POST yields a fully-provisioned agent.
+    //
+    // Idempotent — skipped if the caller explicitly provided env.PAPERCLIP_API_KEY.
+    // Best-effort — if the mint or update fails, the agent is still
+    // created and can be repaired later.
+    try {
+      await provisionAgentPaperclipKeyForHire(agent);
+    } catch (err) {
+      logger.warn(
+        { err, agentId: agent.id },
+        "auto-provision of PAPERCLIP_API_KEY failed — agent created without it",
+      );
+    }
 
     let approval: Awaited<ReturnType<typeof approvalsSvc.getById>> | null = null;
     const actor = getActorInfo(req);
