@@ -157,171 +157,78 @@ function nonEmpty(v: unknown): string | null {
   return typeof v === "string" && v.trim().length > 0 ? v.trim() : null;
 }
 
-function asBoolean(v: unknown): boolean {
-  if (typeof v === "boolean") return v;
-  if (typeof v === "string") return v.trim().toLowerCase() === "true";
-  return false;
-}
-
-// ─── Runtime envelope enforcement (NEW 3 V1.1 stub, -tne) ────────────────────
+// ─── Runtime envelope enforcement (NEW 3 V1.2, -tne) ─────────────────────────
 //
-// Feature-flagged via `adapterConfig.enforceRuntimeEnvelope=true`. Default
-// OFF — V1 is pre-dispatch-only; turning this on activates a best-effort
-// runtime stub. See `ceo-plans/NEW-3-V2-runtime-envelope-enforcement.md`
-// in the overwatch-v3 project for the design.
+// Real runtime enforcement via Claudebridge's `envelope` param on
+// `claude.session.create`. Claudebridge builds an SDK `canUseTool`
+// callback from the rules, denying out-of-envelope tool calls BEFORE
+// they execute. On denial Claudebridge emits a `tool_denied` event
+// which we log to the Paperclip run stdout with a `[envelope_deny]`
+// prefix for the iPad feed parser.
 //
-// This stub is explicitly NOT a security boundary: it relies on
-// (a) Claude reading an envelope block in the systemPrompt and complying,
-// (b) observing tool_use events post-hoc and aborting the session.
-// The proper gate is V1.2 (SDK `canUseTool`) or V2 (openclaw-gateway hook).
+// Replaces the V1.1 stub (prompt-only + post-hoc abort) that lived here.
+// See `ceo-plans/NEW-3-V2-runtime-envelope-enforcement.md` for the full
+// trajectory and where V2 (openclaw-side enforcement) fits in.
 
 type AdapterScope = NonNullable<AdapterExecutionContext["scope"]>;
 
-function renderEnvelopeBlock(scope: AdapterScope): string {
-  const lines: string[] = [
-    "=== Runtime envelope (NEW 3 V1.1) ===",
-    "Your operator has declared a scope envelope for this run. You MUST",
-    "stay inside it. If a request would require a tool, path, or network",
-    "destination outside the envelope, DO NOT attempt the call — instead",
-    "describe what you would have done and ask the operator to widen the",
-    "envelope. Violating the envelope will abort the turn.",
-    "",
-  ];
-  if (scope.allowedTools && scope.allowedTools.length > 0) {
-    lines.push(`allowed_tools: ${scope.allowedTools.join(", ")}`);
-  } else {
-    lines.push("allowed_tools: (no explicit allowlist — use only tools on the implicit allowlist for your role)");
-  }
-  if (scope.deniedTools && scope.deniedTools.length > 0) {
-    lines.push(`denied_tools: ${scope.deniedTools.join(", ")}`);
-  }
-  if (scope.allowedPaths && scope.allowedPaths.length > 0) {
-    lines.push(`allowed_paths: ${scope.allowedPaths.join(", ")}`);
-  }
-  if (scope.deniedPaths && scope.deniedPaths.length > 0) {
-    lines.push(`denied_paths: ${scope.deniedPaths.join(", ")}`);
-  }
-  if (scope.networkAccess) {
-    lines.push(`network_access: ${scope.networkAccess}`);
-  }
-  if (scope.workingDir) {
-    lines.push(`working_dir: ${scope.workingDir} (treat as root for relative paths)`);
-  }
-  lines.push("", "===================================");
-  return lines.join("\n");
+/**
+ * Build the envelope param Claudebridge accepts on session.create from
+ * the Paperclip scope context. Returns null when the scope declares no
+ * enforceable rules — in that case we send NO envelope param at all
+ * so Claudebridge skips installing canUseTool.
+ */
+function buildEnvelopeFromScope(scope: AdapterScope | undefined): {
+  allowedPaths?: string[];
+  deniedPaths?: string[];
+  deniedTools?: string[];
+  networkAccess?: "none" | "localhost" | "full";
+  workingDir?: string;
+} | null {
+  if (!scope) return null;
+  const hasRule =
+    (scope.allowedTools && scope.allowedTools.length > 0) ||
+    (scope.deniedTools && scope.deniedTools.length > 0) ||
+    (scope.allowedPaths && scope.allowedPaths.length > 0) ||
+    (scope.deniedPaths && scope.deniedPaths.length > 0) ||
+    (scope.networkAccess && scope.networkAccess !== "full") ||
+    !!scope.workingDir;
+  if (!hasRule) return null;
+  const env: ReturnType<typeof buildEnvelopeFromScope> = {};
+  if (scope.allowedPaths?.length) env!.allowedPaths = [...scope.allowedPaths];
+  if (scope.deniedPaths?.length) env!.deniedPaths = [...scope.deniedPaths];
+  // allowedTools flows as a separate param in Claudebridge (it maps to
+  // the SDK's declarative allowedTools list, not the canUseTool). See
+  // the session.create call below.
+  if (scope.deniedTools?.length) env!.deniedTools = [...scope.deniedTools];
+  if (scope.networkAccess) env!.networkAccess = scope.networkAccess;
+  if (scope.workingDir) env!.workingDir = scope.workingDir;
+  return env;
 }
 
 /**
- * Compile a scope envelope into a cheap runtime matcher. Returns null when
- * the envelope is effectively empty (nothing to enforce). The matcher
- * intentionally uses simple substring / suffix checks rather than a real
- * glob engine at the stub level — it's advisory, and drift from the
- * pre-dispatch matcher (`server/src/services/allowlist-matcher.ts`) is
- * acceptable for V1.1. V1.2 will replace this with the shared matcher.
+ * Short advisory block telling the agent what the rules are. With real
+ * enforcement in Claudebridge via canUseTool, this is informational —
+ * agents that know their envelope can save turns by not attempting
+ * denied tool calls in the first place.
  */
-type ScopeMatcher = {
-  checkTool(name: string, input: unknown): { ok: true } | { ok: false; rule: string };
-};
-
-function compileScopeMatcher(scope: AdapterScope): ScopeMatcher | null {
-  const allowedTools = scope.allowedTools ?? null;
-  const deniedTools = scope.deniedTools ?? [];
-  const allowedPaths = scope.allowedPaths ?? null;
-  const deniedPaths = scope.deniedPaths ?? [];
-  const networkAccess = scope.networkAccess ?? null;
-
-  const anyRule =
-    (allowedTools && allowedTools.length > 0) ||
-    deniedTools.length > 0 ||
-    (allowedPaths && allowedPaths.length > 0) ||
-    deniedPaths.length > 0 ||
-    networkAccess != null;
-  if (!anyRule) return null;
-
-  // Collect plausible path-looking strings out of a tool's input.
-  const extractCandidatePaths = (input: unknown): string[] => {
-    if (!input || typeof input !== "object") return [];
-    const out: string[] = [];
-    const rec = input as Record<string, unknown>;
-    for (const key of [
-      "file_path",
-      "path",
-      "filePath",
-      "notebook_path",
-      "notebookPath",
-      "directory",
-      "cwd",
-    ]) {
-      const v = rec[key];
-      if (typeof v === "string" && v.length > 0) out.push(v);
-    }
-    return out;
-  };
-
-  // Rough glob-ish matcher: supports leading `**/`, trailing `/**`, and
-  // plain substring. Intentionally conservative (more likely to flag).
-  const matchesPattern = (path: string, pattern: string): boolean => {
-    if (pattern === path) return true;
-    if (pattern.startsWith("**/") && pattern.endsWith("/**")) {
-      return path.includes(pattern.slice(3, -3));
-    }
-    if (pattern.startsWith("**/")) {
-      return path.endsWith(pattern.slice(3));
-    }
-    if (pattern.endsWith("/**")) {
-      return path.startsWith(pattern.slice(0, -3));
-    }
-    return path.includes(pattern);
-  };
-
-  return {
-    checkTool(name, input) {
-      if (deniedTools.includes(name)) {
-        return { ok: false, rule: `deniedTools:${name}` };
-      }
-      if (allowedTools && allowedTools.length > 0 && !allowedTools.includes(name)) {
-        return { ok: false, rule: `allowedTools(not-in-list):${name}` };
-      }
-      const paths = extractCandidatePaths(input);
-      for (const p of paths) {
-        for (const pat of deniedPaths) {
-          if (matchesPattern(p, pat)) {
-            return { ok: false, rule: `deniedPaths:${pat}` };
-          }
-        }
-        if (allowedPaths && allowedPaths.length > 0) {
-          const anyAllow = allowedPaths.some((pat) => matchesPattern(p, pat));
-          if (!anyAllow) {
-            return { ok: false, rule: `allowedPaths(no-match):${p}` };
-          }
-        }
-      }
-      // Very loose network check — only applies to Bash + WebFetch + WebSearch.
-      if (networkAccess === "none" || networkAccess === "localhost") {
-        if (name === "WebFetch" || name === "WebSearch") {
-          if (networkAccess === "none") {
-            return { ok: false, rule: `networkAccess:${networkAccess}` };
-          }
-          // "localhost" can't really be checked for Web* — conservatively deny.
-          return { ok: false, rule: `networkAccess:${networkAccess}:web-tool` };
-        }
-        if (name === "Bash" && typeof (input as { command?: unknown })?.command === "string") {
-          const cmd = (input as { command: string }).command;
-          if (networkAccess === "none" && /\b(curl|wget|nc|http|https:|http:)\b/.test(cmd)) {
-            return { ok: false, rule: `networkAccess:none:bash` };
-          }
-          if (
-            networkAccess === "localhost" &&
-            /\b(curl|wget)\b/.test(cmd) &&
-            !/(127\.0\.0\.1|localhost|::1|0\.0\.0\.0)/.test(cmd)
-          ) {
-            return { ok: false, rule: `networkAccess:localhost:bash` };
-          }
-        }
-      }
-      return { ok: true };
-    },
-  };
+function renderEnvelopeBlock(scope: AdapterScope): string {
+  const lines: string[] = [
+    "=== Runtime envelope (enforced) ===",
+    "Your operator has declared a scope envelope for this run.",
+    "Tool calls outside the envelope are rejected BEFORE they execute",
+    "(you'll see a deny response). The rules:",
+    "",
+  ];
+  if (scope.allowedTools?.length) lines.push(`allowed_tools: ${scope.allowedTools.join(", ")}`);
+  if (scope.deniedTools?.length) lines.push(`denied_tools: ${scope.deniedTools.join(", ")}`);
+  if (scope.allowedPaths?.length) lines.push(`allowed_paths: ${scope.allowedPaths.join(", ")}`);
+  if (scope.deniedPaths?.length) lines.push(`denied_paths: ${scope.deniedPaths.join(", ")}`);
+  if (scope.networkAccess) lines.push(`network_access: ${scope.networkAccess}`);
+  if (scope.workingDir) lines.push(`working_dir: ${scope.workingDir}`);
+  lines.push("", "If a needed action is outside the envelope, stop and ask the operator to widen it.");
+  lines.push("===================================");
+  return lines.join("\n");
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -333,19 +240,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const rawSystemPrompt = nonEmpty(config.systemPrompt) ?? undefined;
   const label = nonEmpty(config.label) ?? agent.name;
 
-  // NEW 3 V1.1 (-tne): feature-flagged runtime envelope enforcement.
-  // When enabled, the adapter (a) prepends a concrete envelope block to
-  // the systemPrompt (so Claude sees the allowlist declaratively) and
-  // (b) observes tool_use events; a tool call that violates the envelope
-  // aborts the session and returns errorCode="envelope_violation".
-  // This is advisory, not a real gate — see the design doc at
-  // overwatch-v3/ceo-plans/NEW-3-V2-runtime-envelope-enforcement.md for
-  // why, and for the V1.2/V2 upgrade path.
-  const enforceRuntimeEnvelope = asBoolean(config.enforceRuntimeEnvelope);
-  const scope = enforceRuntimeEnvelope ? (ctx.scope ?? null) : null;
-  const scopeMatcher: ScopeMatcher | null = scope ? compileScopeMatcher(scope) : null;
+  // NEW 3 V1.2 (-tne): real runtime envelope enforcement via
+  // Claudebridge's canUseTool callback. When ctx.scope has any rule
+  // set, we pass an `envelope` param on session.create and Claudebridge
+  // gates each tool call. Also prepend an advisory block to the
+  // systemPrompt so the agent knows the rules. Always-on — no feature
+  // flag. Empty scope = no envelope param sent = no enforcement.
+  const scope = ctx.scope ?? null;
+  const envelopeParam = scope ? buildEnvelopeFromScope(scope) : null;
+  const allowedToolsList =
+    scope?.allowedTools && scope.allowedTools.length > 0 ? [...scope.allowedTools] : undefined;
   const systemPrompt =
-    scope && scopeMatcher
+    scope && envelopeParam
       ? [renderEnvelopeBlock(scope), rawSystemPrompt].filter(Boolean).join("\n\n")
       : rawSystemPrompt;
 
@@ -462,15 +368,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Track accumulated text output for summary.
     let textAccumulator = "";
 
-    // NEW 3 V1.1 (-tne): runtime envelope violation tracker. When the
-    // matcher flags a dispatched tool call, we stash the violation and
-    // abort the session below. The run returns errorCode="envelope_violation".
-    let envelopeViolation: {
-      toolName: string;
-      rule: string;
-      inputSnippet: string;
-    } | null = null;
-
     client.setEventHandler((env) => {
       if (env.type === "text_delta") {
         const text = (env.payload as { text: string }).text;
@@ -488,62 +385,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (env.type === "tool_use") {
         const p = env.payload as { name: string; toolUseId: string; input: unknown };
         void onLog("stdout", `\n[tool_use] ${p.name} ${JSON.stringify(p.input)}\n`);
+        return;
+      }
 
-        // Runtime envelope check (best-effort, post-hoc).
-        if (scopeMatcher && !envelopeViolation) {
-          try {
-            const check = scopeMatcher.checkTool(p.name, p.input);
-            if (!check.ok) {
-              let snippet = "";
-              try {
-                snippet = JSON.stringify(p.input).slice(0, 200);
-              } catch {
-                snippet = "<unserializable>";
-              }
-              envelopeViolation = {
-                toolName: p.name,
-                rule: check.rule,
-                inputSnippet: snippet,
-              };
-              const event = {
-                ts: new Date().toISOString(),
-                type: "envelope_violation",
-                toolName: p.name,
-                matchedRule: check.rule,
-                enforcement: "post_hoc_abort",
-                action: "turn_aborted",
-                inputSnippet: snippet,
-              };
-              void onLog("stderr", `[envelope_violation] ${JSON.stringify(event)}\n`);
-              // Abort the session — best-effort, we don't await.
-              void (async () => {
-                try {
-                  await client.request(
-                    "claude.session.close",
-                    { sessionId: claudebridgeSessionId },
-                    5_000,
-                  );
-                } catch {
-                  // Ignore — the close may race with turn completion.
-                }
-                if (!turnEnded) {
-                  turnEnded = true;
-                  turnEndReject(
-                    new Error(
-                      `envelope_violation: ${p.name} rejected by rule ${check.rule}`,
-                    ),
-                  );
-                }
-              })();
-            }
-          } catch (err) {
-            // Never let the matcher crash the run.
-            void onLog(
-              "stderr",
-              `[envelope_matcher_error] ${err instanceof Error ? err.message : String(err)}\n`,
-            );
-          }
-        }
+      // NEW 3 V1.2 (-tne): Claudebridge's canUseTool callback fires this
+      // event when it denies a tool call BEFORE it executes. Log with a
+      // structured prefix the iPad's LiveRunFeed parser recognizes to
+      // render a distinct "DENIED" chip.
+      if (env.type === "tool_denied") {
+        const p = env.payload as {
+          toolName: string;
+          input: unknown;
+          reason: string;
+          matchedPattern?: string;
+        };
+        const patternSuffix = p.matchedPattern ? ` (pattern: ${p.matchedPattern})` : "";
+        void onLog(
+          "stdout",
+          `\n[envelope_deny] ${p.toolName}: ${p.reason}${patternSuffix}\n`,
+        );
         return;
       }
 
@@ -592,6 +452,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     if (isNewSession) {
+      // NEW 3 V1.2 (-tne): when an envelope is active, DROP
+      // permissionMode=bypassPermissions. bypassPermissions in the
+      // Claude Agent SDK short-circuits canUseTool — if we keep it
+      // while also supplying envelope, the envelope is never
+      // consulted. With envelope present, fall back to the SDK's
+      // default permission flow (which respects canUseTool) but also
+      // pass our allowlist so deterministic tool-name checks don't
+      // even hit canUseTool.
+      const effectivePermissionMode = envelopeParam ? "default" : "bypassPermissions";
       const createResult = (await client.request(
         "claude.session.create",
         {
@@ -601,12 +470,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           label,
           ownerTag: "paperclip",
           env: paperclipEnv,
-          // NEW 0-B-8 (-tne): Paperclip-owned agents run with
-          // bypassPermissions so their Bash tool can actually call
-          // Paperclip's API (curl, printenv, etc). Policy enforcement
-          // lives upstream in Paperclip's envelope, not here.
-          permissionMode: "bypassPermissions",
+          permissionMode: effectivePermissionMode,
           ...(systemPrompt ? { systemPrompt } : {}),
+          ...(allowedToolsList ? { allowedTools: allowedToolsList } : {}),
+          ...(scope?.deniedTools?.length ? { disallowedTools: [...scope.deniedTools] } : {}),
+          ...(envelopeParam ? { envelope: envelopeParam } : {}),
         },
         30_000,
       )) as { sessionId: string; worktreePath: string };
@@ -677,20 +545,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const msg = err instanceof Error ? err.message : String(err);
     await onLog("stderr", `[claudebridge_local] error: ${msg}\n`);
     const isAbort = msg === "aborted" || (err instanceof Error && err.name === "AbortError");
-    // NEW 3 V1.1 (-tne): distinguish envelope-violation aborts from generic
-    // errors so the operator (and downstream state machines like autonomy
-    // demotion at V2) can key off the errorCode.
-    const isEnvelope = msg.startsWith("envelope_violation:");
+    // NEW 3 V1.2: envelope violations are non-fatal — Claudebridge denies
+    // the tool call, the agent receives a deny response, and the run
+    // continues. So we no longer error-code here on envelope violations.
     return {
       exitCode: isAbort ? 130 : 1,
       signal: isAbort ? "SIGINT" : null,
       timedOut: false,
       errorMessage: msg,
-      errorCode: isEnvelope
-        ? "envelope_violation"
-        : isAbort
-          ? "aborted"
-          : "claudebridge_error",
+      errorCode: isAbort ? "aborted" : "claudebridge_error",
     };
   } finally {
     client.close();
