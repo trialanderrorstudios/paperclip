@@ -801,3 +801,14 @@ export {
   type SecretsLocalEncryptedConfig,
   type ConfigMeta,
 } from "./config-schema.js";
+
+// NEW 3 V1.2 (-tne): shared envelope matcher used by pre-dispatch
+// (autonomy-state-machine) and runtime (claudebridge-local adapter) so the
+// two layers enforce identical semantics.
+export {
+  matchToolCall,
+  matchPath,
+  checkBashNetwork,
+  type EnvelopeRules,
+  type MatchResult,
+} from "./envelope-matcher.js";
