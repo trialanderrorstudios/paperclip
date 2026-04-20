@@ -716,6 +716,45 @@ export function agentRoutes(db: Db) {
     return { ...adapterConfig, devicePrivateKeyPem: generateEd25519PrivateKeyPem() };
   }
 
+  /**
+   * NEW 0-B-6 (-tne): Overwatch-v3 delegation path. When a caller POSTs
+   * agent-hires with adapterType=openclaw_gateway but leaves the
+   * gateway-specific fields empty, fill them from env so the CEO can
+   * delegate to openclaw-routed subordinates with a minimal body
+   * (just role + name + capabilities) — they don't need to hold the
+   * gateway admin token or know the loopback URL.
+   *
+   * Env:
+   *   OPENCLAW_GATEWAY_URL    default ws://127.0.0.1:18789
+   *   OPENCLAW_GATEWAY_TOKEN  required on non-loopback gateway deployments
+   *
+   * Explicit adapterConfig fields always win — this is a fill-in, not
+   * a forced override.
+   */
+  function applyOpenclawGatewayEnvDefaults(
+    adapterType: string | null | undefined,
+    adapterConfig: Record<string, unknown>,
+  ): Record<string, unknown> {
+    if (adapterType !== "openclaw_gateway") return adapterConfig;
+    const next = { ...adapterConfig };
+    if (!asNonEmptyString(next.url)) {
+      const envUrl = asNonEmptyString(process.env.OPENCLAW_GATEWAY_URL);
+      next.url = envUrl ?? "ws://127.0.0.1:18789";
+    }
+    const headersRecord = asRecord(next.headers) ?? {};
+    const hasTokenHeader =
+      asNonEmptyString(headersRecord["x-openclaw-token"]) !== null ||
+      asNonEmptyString(headersRecord["x-openclaw-auth"]) !== null ||
+      asNonEmptyString(headersRecord["authorization"]) !== null;
+    if (!hasTokenHeader) {
+      const envToken = asNonEmptyString(process.env.OPENCLAW_GATEWAY_TOKEN);
+      if (envToken) {
+        next.headers = { ...headersRecord, "x-openclaw-token": envToken };
+      }
+    }
+    return next;
+  }
+
   function applyCreateDefaultsByAdapterType(
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
@@ -741,7 +780,10 @@ export function agentRoutes(db: Db) {
     if (adapterType === "cursor" && !asNonEmptyString(next.model)) {
       next.model = DEFAULT_CURSOR_LOCAL_MODEL;
     }
-    return ensureGatewayDeviceKey(adapterType, next);
+    return applyOpenclawGatewayEnvDefaults(
+      adapterType,
+      ensureGatewayDeviceKey(adapterType, next),
+    );
   }
 
   async function assertAdapterConfigConstraints(
