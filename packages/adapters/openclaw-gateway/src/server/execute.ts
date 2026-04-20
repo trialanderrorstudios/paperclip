@@ -1187,7 +1187,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     idempotencyKey: ctx.runId,
   };
   delete agentParams.text;
-  agentParams.paperclip = paperclipPayload;
+
+  // NEW 0-B-3 (-tne): openclaw gateway 2026.4.x enforces AJV
+  // `additionalProperties: false` on agent method params, so anything
+  // beyond the documented fields (message, sessionKey, idempotencyKey,
+  // agentId, timeout, provider, model, channels, ...) gets rejected
+  // with "invalid agent params: at root: unexpected property '…'".
+  //
+  // Both `paperclip` (upstream metadata envelope) and `scope` (NEW
+  // 0-B-2) are extras by that definition. We already thread the
+  // Paperclip context into `message` via wakeText, so downstream
+  // consumers don't lose it.
+  //
+  // Default is to omit. Set adapterConfig.includeGatewayMetadata=true
+  // once you're on an openclaw build that accepts these keys.
+  const includeGatewayMetadata = parseBoolean(ctx.config.includeGatewayMetadata, false);
+  if (includeGatewayMetadata) {
+    agentParams.paperclip = paperclipPayload;
+  }
 
   const configuredAgentId = nonEmpty(ctx.config.agentId);
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {
@@ -1198,14 +1215,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     agentParams.timeout = waitTimeoutMs;
   }
 
-  // NEW 0-B-2 (-tne): include structured scope on the WS spawn frame.
-  // Advisory only at V1 — openclaw-side enforcement lands in V1.1 per the
-  // Overwatch-v3 plan. We intentionally set this on agentParams.scope (the
-  // top-level `agent` method params) rather than nesting it under
-  // `paperclip.*`, keeping the envelope obvious to downstream consumers.
-  const serializedScope = serializeAdapterScope(ctx.scope);
-  if (serializedScope) {
-    agentParams.scope = serializedScope;
+  // NEW 0-B-2 (-tne) structured scope. See includeGatewayMetadata note
+  // above — same reason. Enforcement is V1.1, so omitting at V1 is
+  // consistent with the plan.
+  if (includeGatewayMetadata) {
+    const serializedScope = serializeAdapterScope(ctx.scope);
+    if (serializedScope) {
+      agentParams.scope = serializedScope;
+    }
   }
 
   if (ctx.onMeta) {
