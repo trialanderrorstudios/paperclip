@@ -582,8 +582,14 @@ export async function startServer(): Promise<StartedServer> {
   
     // Reap orphaned running runs at startup while in-memory execution state is empty,
     // then resume any persisted queued runs that were waiting on the previous process.
+    //
+    // NEW 0-B-10 (-tne): markOrphanedRunsFromRestart() runs FIRST, before the
+    // liveness reaper, so rows stranded by a Paperclip/tsx-watch restart get
+    // tagged with the more-specific `orphaned_pre_restart` errorCode
+    // instead of being swept up by reapOrphanedRuns as `process_lost`.
     void heartbeat
-      .reapOrphanedRuns()
+      .markOrphanedRunsFromRestart()
+      .then(() => heartbeat.reapOrphanedRuns())
       .then(() => heartbeat.resumeQueuedRuns())
       .then(async () => {
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();

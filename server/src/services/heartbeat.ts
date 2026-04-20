@@ -90,6 +90,14 @@ const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+// NEW 0-B-10 (-tne): orphan-resilience horizon. Only boot-scan runs whose
+// processStartedAt is within the last 2 hours. Older rows are almost
+// certainly stale leftovers from prior boots and the existing reaper path
+// already handles them with its own errorCode.
+const ORPHAN_RESILIENCE_WINDOW_MS = 2 * 60 * 60 * 1000;
+// NEW 0-B-11 (-tne): grace period between SIGTERM and SIGKILL when forcibly
+// killing a run's child process via killRunProcess().
+const KILL_RUN_FORCE_AFTER_MS = 5_000;
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -2751,6 +2759,147 @@ export function heartbeatService(db: Db) {
     }
   }
 
+  /**
+   * NEW 0-B-10 (-tne): orphan resilience across a Paperclip restart.
+   *
+   * When Paperclip (or its parent tsx-watch) restarts, any in-flight
+   * heartbeat_runs that were tied to an in-memory process handle are
+   * stranded: the DB row stays `status=running` and `processPid` still
+   * points at a pid Paperclip no longer owns. The existing reaper eventually
+   * marks them `failed: process_lost` with the confusing message "child pid
+   * N is still alive" even though we've actually just lost the handle.
+   *
+   * On boot, walk the active (running/queued) rows with a recent
+   * `processStartedAt` (within the last 2h) and:
+   *   - if the PID is dead (ESRCH) → mark failed with errorCode
+   *     `orphaned_pre_restart`, so operators can see at a glance that the
+   *     row came from a pre-restart crash, not the normal liveness reaper.
+   *   - if the PID is still alive → leave it alone but emit a warn log.
+   *     Reattachment is Tier 5 scope; the point of this pass is to stop
+   *     lying about status, not to take back ownership.
+   *
+   * Runs BEFORE `reapOrphanedRuns` in the boot chain (see server/src/index.ts).
+   * If the order were reversed, `reapOrphanedRuns` would stamp these rows
+   * with `process_lost` first, and the more-specific `orphaned_pre_restart`
+   * errorCode would never be set.
+   */
+  async function markOrphanedRunsFromRestart() {
+    const now = new Date();
+    const horizon = new Date(now.getTime() - ORPHAN_RESILIENCE_WINDOW_MS);
+
+    const candidates = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          inArray(heartbeatRuns.status, [...ACTIVE_HEARTBEAT_RUN_STATUSES]),
+          sql`${heartbeatRuns.processPid} is not null`,
+          gt(heartbeatRuns.processStartedAt, horizon),
+        ),
+      );
+
+    let markedDead = 0;
+    let leftAlive = 0;
+
+    for (const run of candidates) {
+      // Skip rows the current process is actively tracking — those are
+      // by definition NOT orphaned-from-a-previous-boot.
+      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+
+      if (!run.processPid) continue;
+
+      if (isProcessAlive(run.processPid)) {
+        leftAlive += 1;
+        logger.warn(
+          { runId: run.id, agentId: run.agentId, processPid: run.processPid },
+          "boot-orphan scan: heartbeat run's child pid is still alive but Paperclip has no handle; leaving status intact (reattachment is Tier 5)",
+        );
+        continue;
+      }
+
+      const errorMessage = "Process lost during Paperclip restart";
+      const finalized = await setRunStatus(run.id, "failed", {
+        finishedAt: now,
+        error: errorMessage,
+        errorCode: "orphaned_pre_restart",
+      });
+      await setWakeupStatus(run.wakeupRequestId, "failed", {
+        finishedAt: now,
+        error: errorMessage,
+      });
+
+      if (finalized) {
+        await appendRunEvent(finalized, await nextRunEventSeq(finalized.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "error",
+          message: errorMessage,
+          payload: {
+            processPid: run.processPid,
+            ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+          },
+        });
+        await releaseIssueExecutionAndPromote(finalized);
+      }
+      await finalizeAgentStatus(run.agentId, "failed");
+      markedDead += 1;
+    }
+
+    if (markedDead > 0 || leftAlive > 0) {
+      logger.warn(
+        { markedDead, leftAlive, scanned: candidates.length },
+        "boot-orphan scan completed",
+      );
+    }
+    return { markedDead, leftAlive, scanned: candidates.length };
+  }
+
+  /**
+   * NEW 0-B-11 (-tne): force-terminate the child process associated with
+   * a heartbeat run.
+   *
+   * Today, cancelRun tears down Paperclip's in-memory handle but the
+   * underlying Claude CLI child (or any other local adapter child) keeps
+   * running. Operator cancels should be able to actually kill the child.
+   *
+   * Sends SIGTERM best-effort, then SIGKILL after KILL_RUN_FORCE_AFTER_MS
+   * if the process is still alive. The heavy lifting lives in
+   * `terminateLocalService` (see local-service-supervisor.ts) which already
+   * implements the TERM-wait-KILL escalation via `forceAfterMs`.
+   *
+   * Returns true if a kill was attempted on a live pid, false when the pid
+   * is unknown or already dead.
+   */
+  async function killRunProcess(runId: string, reason: string): Promise<boolean> {
+    const run = await getRun(runId);
+    if (!run) return false;
+
+    const running = runningProcesses.get(run.id);
+    const pid = running?.child.pid ?? run.processPid ?? null;
+    const processGroupId = running?.processGroupId ?? run.processGroupId ?? null;
+
+    if (typeof pid !== "number" && typeof processGroupId !== "number") {
+      logger.warn({ runId, reason }, "killRunProcess: no pid or process group known for run");
+      return false;
+    }
+
+    // If we have a pid but it's already dead, treat as already-gone.
+    if (typeof pid === "number" && !isProcessAlive(pid)) {
+      // Still attempt group cleanup when a descendant group is alive —
+      // rare, but matches the liveness reaper's behaviour.
+      if (typeof processGroupId === "number" && isProcessGroupAlive(processGroupId)) {
+        await terminateHeartbeatRunProcess({ pid, processGroupId, graceMs: KILL_RUN_FORCE_AFTER_MS });
+        logger.info({ runId, processGroupId, reason }, "killRunProcess: pid already dead, cleaned descendant group");
+        return true;
+      }
+      return false;
+    }
+
+    await terminateHeartbeatRunProcess({ pid, processGroupId, graceMs: KILL_RUN_FORCE_AFTER_MS });
+    logger.info({ runId, pid, processGroupId, reason }, "killRunProcess: SIGTERM issued, SIGKILL escalation armed");
+    return true;
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -5079,11 +5228,20 @@ export function heartbeatService(db: Db) {
     return wakeupIds.length;
   }
 
-  async function cancelRunInternal(runId: string, reason = "Cancelled by control plane") {
+  async function cancelRunInternal(
+    runId: string,
+    reason = "Cancelled by control plane",
+    opts?: { errorCode?: string },
+  ) {
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     if (run.status !== "running" && run.status !== "queued") return run;
 
+    // NEW 0-B-11 (-tne): delegate the actual pid-kill dance to
+    // killRunProcess so operator-initiated cancels get a SIGTERM → 5s grace
+    // → SIGKILL escalation even when we no longer have the in-memory
+    // child handle (e.g., after a Paperclip restart). Falls back to the
+    // per-run grace window when we still own the process.
     const running = runningProcesses.get(run.id);
     if (running) {
       await terminateHeartbeatRunProcess({
@@ -5092,16 +5250,13 @@ export function heartbeatService(db: Db) {
         graceMs: Math.max(1, running.graceSec) * 1000,
       });
     } else if (run.processPid || run.processGroupId) {
-      await terminateHeartbeatRunProcess({
-        pid: run.processPid,
-        processGroupId: run.processGroupId,
-      });
+      await killRunProcess(run.id, reason);
     }
 
     const cancelled = await setRunStatus(run.id, "cancelled", {
       finishedAt: new Date(),
       error: reason,
-      errorCode: "cancelled",
+      errorCode: opts?.errorCode ?? "cancelled",
     });
 
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
@@ -5382,6 +5537,8 @@ export function heartbeatService(db: Db) {
 
     reapOrphanedRuns,
 
+    markOrphanedRunsFromRestart,
+
     resumeQueuedRuns,
 
     reconcileStrandedAssignedIssues,
@@ -5443,7 +5600,17 @@ export function heartbeatService(db: Db) {
       return { checked, enqueued, skipped };
     },
 
-    cancelRun: (runId: string) => cancelRunInternal(runId),
+    // NEW 0-B-11 (-tne): operator-facing cancel. Tag the persisted row
+    // with `operator_cancelled` + the canonical message so operators can
+    // distinguish manual cancels from control-plane/budget/agent-paused
+    // cancels (which still flow through cancelRunInternal with their own
+    // reasons and the generic `cancelled` errorCode).
+    cancelRun: (runId: string) =>
+      cancelRunInternal(runId, "Operator-initiated cancellation", {
+        errorCode: "operator_cancelled",
+      }),
+
+    killRunProcess,
 
     cancelActiveForAgent: (agentId: string) => cancelActiveForAgentInternal(agentId),
 
