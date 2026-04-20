@@ -198,8 +198,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   }
 
-  // Paperclip env vars (PAPERCLIP_AGENT_ID, PAPERCLIP_COMPANY_ID, etc.).
-  const paperclipEnv = buildPaperclipEnv(agent);
+  // Paperclip env vars (PAPERCLIP_AGENT_ID, PAPERCLIP_COMPANY_ID, etc.)
+  // merged onto the parent process env. buildPaperclipEnv returns only
+  // Paperclip-specific vars; if we pass that raw the child Claude Code
+  // CLI loses HOME/PATH/XDG_CONFIG_HOME and can't find its auth
+  // (manifests as "Not logged in · Please run /login" even though
+  // `claude auth status` is healthy on the Mac).
+  const processEnv: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v === "string") processEnv[k] = v;
+  }
+  const paperclipEnv: Record<string, string> = {
+    ...processEnv,
+    ...buildPaperclipEnv(agent),
+  };
   // Also pass auth token so the agent can call back to Paperclip.
   if (ctx.authToken) paperclipEnv["PAPERCLIP_API_KEY"] = ctx.authToken;
 
