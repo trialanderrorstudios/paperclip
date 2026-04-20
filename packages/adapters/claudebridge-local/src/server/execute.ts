@@ -179,10 +179,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   }
 
-  // Build the wake prompt exactly as other adapters do.
-  const wakePayload = context?.wakePayload;
+  // Build the wake prompt. Paperclip's adapter context puts the
+  // operator's reason (the Captain's Desk prompt) at context.wakeReason —
+  // same field claude-local reads. context.paperclipWake carries the
+  // issue-thread wake payload when a run is issue-bound.
+  const wakePayload = context?.paperclipWake;
   const wakePromptSection = wakePayload ? renderPaperclipWakePrompt(wakePayload) : null;
-  const rawPrompt = nonEmpty(context?.prompt as string) ?? "";
+  const rawPrompt = nonEmpty(context?.wakeReason as string) ?? "";
   const wakeText = [rawPrompt, wakePromptSection].filter(Boolean).join("\n\n").trim();
 
   if (!wakeText) {
