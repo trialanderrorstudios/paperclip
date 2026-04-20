@@ -55,4 +55,20 @@ describe("buildPaperclipEnv", () => {
 
     expect(env.PAPERCLIP_API_URL).toBe("http://[::1]:3101");
   });
+
+  it("exports git identity overrides derived from agent.name (NEW 0-B-9, -tne)", () => {
+    const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1", name: "Jinx" });
+
+    expect(env.GIT_AUTHOR_NAME).toBe("Jinx");
+    expect(env.GIT_COMMITTER_NAME).toBe("Jinx");
+    expect(env.GIT_AUTHOR_EMAIL).toBe("agent+jinx@paperclip.local");
+    expect(env.GIT_COMMITTER_EMAIL).toBe("agent+jinx@paperclip.local");
+  });
+
+  it("falls back to the 'Agent' identity when agent.name is missing", () => {
+    const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
+
+    expect(env.GIT_AUTHOR_NAME).toBe("Agent");
+    expect(env.GIT_AUTHOR_EMAIL).toBe("agent+agent@paperclip.local");
+  });
 });

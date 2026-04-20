@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { runChildProcess } from "./server-utils.js";
+import { buildPaperclipEnv, runChildProcess, slugifyAgentName } from "./server-utils.js";
 
 function isPidAlive(pid: number) {
   try {
@@ -84,5 +84,49 @@ describe("runChildProcess", () => {
     expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
 
     expect(await waitForPidExit(descendantPid!, 2_000)).toBe(true);
+  });
+});
+
+describe("slugifyAgentName", () => {
+  it("lowercases and replaces whitespace with -", () => {
+    expect(slugifyAgentName("Jinx")).toBe("jinx");
+    expect(slugifyAgentName("Captain Hook")).toBe("captain-hook");
+    expect(slugifyAgentName("  Dr.  Strange  ")).toBe("dr-strange");
+  });
+
+  it("strips non-alphanumerics (except -) and collapses runs", () => {
+    expect(slugifyAgentName("A_b@c!!")).toBe("abc");
+    expect(slugifyAgentName("foo--bar")).toBe("foo-bar");
+    expect(slugifyAgentName("--lead--")).toBe("lead");
+  });
+
+  it("falls back to 'agent' for unusable input", () => {
+    expect(slugifyAgentName("")).toBe("agent");
+    expect(slugifyAgentName("   ")).toBe("agent");
+    expect(slugifyAgentName("!!!")).toBe("agent");
+    expect(slugifyAgentName(null)).toBe("agent");
+    expect(slugifyAgentName(undefined)).toBe("agent");
+  });
+});
+
+describe("buildPaperclipEnv git identity vars", () => {
+  it("injects GIT_* overrides keyed to the agent's display name", () => {
+    const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1", name: "Jinx" });
+    expect(env.GIT_AUTHOR_NAME).toBe("Jinx");
+    expect(env.GIT_COMMITTER_NAME).toBe("Jinx");
+    expect(env.GIT_AUTHOR_EMAIL).toBe("agent+jinx@paperclip.local");
+    expect(env.GIT_COMMITTER_EMAIL).toBe("agent+jinx@paperclip.local");
+  });
+
+  it("slugifies whitespace and punctuation in agent name for the email local part", () => {
+    const env = buildPaperclipEnv({ id: "a", companyId: "c", name: "Captain Hook Jr." });
+    expect(env.GIT_AUTHOR_NAME).toBe("Captain Hook Jr.");
+    expect(env.GIT_AUTHOR_EMAIL).toBe("agent+captain-hook-jr@paperclip.local");
+  });
+
+  it("falls back to 'Agent' identity when agent.name is missing", () => {
+    const env = buildPaperclipEnv({ id: "a", companyId: "c" });
+    expect(env.GIT_AUTHOR_NAME).toBe("Agent");
+    expect(env.GIT_AUTHOR_EMAIL).toBe("agent+agent@paperclip.local");
   });
 });

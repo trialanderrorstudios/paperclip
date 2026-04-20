@@ -535,16 +535,68 @@ export function buildInvocationEnvForLogs(
   return redactEnvForLogs(merged);
 }
 
-export function buildPaperclipEnv(agent: { id: string; companyId: string }): Record<string, string> {
+/**
+ * Slugify an agent name for use in a synthetic git email address.
+ *
+ * Rule: lowercase, replace whitespace runs with "-", strip anything that is
+ * not alphanumeric or "-", then collapse leading/trailing "-" and runs of
+ * consecutive "-". Empty or unusable input returns "agent".
+ *
+ * NEW 0-B-9, -tne delta. Stable / deterministic so the same agent name always
+ * produces the same committer email across runs and processes.
+ */
+export function slugifyAgentName(name: string | null | undefined): string {
+  if (typeof name !== "string") return "agent";
+  const lowered = name.toLowerCase().trim();
+  if (!lowered) return "agent";
+  const slug = lowered
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9-]+/g, "")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug.length > 0 ? slug : "agent";
+}
+
+/**
+ * Build the standard environment injected into every Paperclip-spawned
+ * adapter child process.
+ *
+ * Exports the PAPERCLIP_* identity/URL vars AND the four git identity
+ * override vars (`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`,
+ * `GIT_COMMITTER_EMAIL`) so that when an agent's tool (e.g. Claude Code's
+ * Bash tool) shells out to `git commit`, the commit is attributed to the
+ * agent rather than to whatever local git identity the operator has
+ * configured in `~/.gitconfig` or the repo's `.git/config`.
+ *
+ * Git's env vars are a per-operation override: they win over `git config`
+ * without any `git config` mutation on the host machine. The one gotcha:
+ * a commit hook or explicit `git commit --author=...` flag can still
+ * override these env vars (env-precedence does not beat `--author`).
+ * NEW 0-B-9, -tne delta.
+ */
+export function buildPaperclipEnv(
+  agent: { id: string; companyId: string; name?: string | null },
+): Record<string, string> {
   const resolveHostForUrl = (rawHost: string): string => {
     const host = rawHost.trim();
     if (!host || host === "0.0.0.0" || host === "::") return "localhost";
     if (host.includes(":") && !host.startsWith("[") && !host.endsWith("]")) return `[${host}]`;
     return host;
   };
+  const agentName =
+    typeof agent.name === "string" && agent.name.trim().length > 0 ? agent.name.trim() : "Agent";
+  const agentSlug = slugifyAgentName(agentName);
+  const agentEmail = `agent+${agentSlug}@paperclip.local`;
   const vars: Record<string, string> = {
     PAPERCLIP_AGENT_ID: agent.id,
     PAPERCLIP_COMPANY_ID: agent.companyId,
+    // Git per-operation identity override (NEW 0-B-9, -tne delta). Beats
+    // `git config` without mutating it. See JSDoc above for the
+    // commit-hook / `--author=` precedence gotcha.
+    GIT_AUTHOR_NAME: agentName,
+    GIT_AUTHOR_EMAIL: agentEmail,
+    GIT_COMMITTER_NAME: agentName,
+    GIT_COMMITTER_EMAIL: agentEmail,
   };
   const runtimeHost = resolveHostForUrl(
     process.env.PAPERCLIP_LISTEN_HOST ?? process.env.HOST ?? "localhost",
