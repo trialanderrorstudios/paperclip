@@ -362,13 +362,14 @@ function buildWakeText(
   payload: WakePayload,
   paperclipEnv: Record<string, string>,
   structuredWakePrompt: string,
+  config: Record<string, unknown>,
 ): string {
   // NEW 0-B-4 (-tne): operator-prompt mode. When there's no issue or
   // task to execute, just a direct operator prompt (Overwatch-v3
   // Captain's Desk), skip the Paperclip claim workflow entirely. The
   // CEO gets the task as-is, no API-key scavenger hunt.
   if (!payload.taskId && !payload.issueId && payload.wakeReason) {
-    return buildOperatorPromptWakeText(payload, paperclipEnv, structuredWakePrompt);
+    return buildOperatorPromptWakeText(payload, paperclipEnv, structuredWakePrompt, config);
   }
 
   const claimedApiKeyPath = "~/.openclaw/workspace/paperclip-claimed-api-key.json";
@@ -457,12 +458,18 @@ function buildWakeText(
  * a free-form prompt. The CEO gets the prompt as the primary task and
  * is free to call Paperclip's API if they need it, but is NOT forced
  * to load an API key or run the checkout workflow first.
+ *
+ * NEW 0-B-5 (-tne): when adapterConfig.paperclipAgentKey is set, we
+ * pass it inline so the CEO can hire subordinates and update state
+ * without a file-based scavenger hunt.
  */
 function buildOperatorPromptWakeText(
   payload: WakePayload,
   paperclipEnv: Record<string, string>,
   structuredWakePrompt: string,
+  config: Record<string, unknown>,
 ): string {
+  const paperclipAgentKey = nonEmpty(config.paperclipAgentKey);
   const lines = [
     "Operator task from the board (Overwatch-v3 Captain's Desk).",
     "",
@@ -477,12 +484,17 @@ function buildOperatorPromptWakeText(
   if (paperclipEnv.PAPERCLIP_API_URL) {
     lines.push(`PAPERCLIP_API_URL=${paperclipEnv.PAPERCLIP_API_URL}`);
   }
+  if (paperclipAgentKey) {
+    lines.push(`PAPERCLIP_API_KEY=${paperclipAgentKey}`);
+  }
   lines.push(
     "",
     "Rules:",
     "- Execute the task directly. No issue checkout, no API claim workflow.",
-    "- You do NOT need a PAPERCLIP_API_KEY for this run. Do not search for one.",
-    "- If you need Paperclip state (issues, agents, approvals), those endpoints are available; call them as needed.",
+    paperclipAgentKey
+      ? "- You HAVE a PAPERCLIP_API_KEY above. Use `Authorization: Bearer $PAPERCLIP_API_KEY` to hit /api/*."
+      : "- You do NOT have a PAPERCLIP_API_KEY for this run. Do not search for one.",
+    "- Hire subordinates when the task benefits from it: POST /api/companies/$PAPERCLIP_COMPANY_ID/agent-hires",
     "- Report your work as the final assistant message. That's how the operator sees results.",
   );
   if (structuredWakePrompt) {
@@ -1212,6 +1224,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     structuredWakeJson
       ? joinWakePayloadSections(structuredWakePrompt, structuredWakeJson)
       : structuredWakePrompt,
+    parseObject(ctx.config),
   );
 
   const sessionKeyStrategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
