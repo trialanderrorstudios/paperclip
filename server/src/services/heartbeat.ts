@@ -706,6 +706,23 @@ function summarizeRunFailureForIssueComment(
   return null;
 }
 
+// Lift workspace-fallback warnings out of the run's contextSnapshot so they
+// land in the blocked-issue comment. Without this they only appear as
+// [paperclip] stdout log lines inside the run log, which operators never
+// see when scanning the board for why something got auto-blocked.
+function summarizeWorkspaceWarnings(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): string | null {
+  if (!contextSnapshot) return null;
+  const raw = contextSnapshot.paperclipWorkspaceWarnings;
+  if (!Array.isArray(raw)) return null;
+  const first = raw.find((v): v is string => typeof v === "string" && v.trim().length > 0);
+  if (!first) return null;
+  const trimmed = first.trim();
+  const truncated = trimmed.length > 240 ? `${trimmed.slice(0, 237)}...` : trimmed;
+  return ` Workspace warning: ${truncated}`;
+}
+
 function normalizeLedgerBillingType(value: unknown): BillingType {
   const raw = readNonEmptyString(value);
   switch (raw) {
@@ -3215,6 +3232,7 @@ export function heartbeatService(db: Db) {
       const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
       const latestContext = parseObject(latestRun?.contextSnapshot);
       const latestRetryReason = readNonEmptyString(latestContext.retryReason);
+      const workspaceWarningSummary = summarizeWorkspaceWarnings(latestContext);
 
       if (issue.status === "todo") {
         if (!latestRun || latestRun.status === "succeeded") {
@@ -3230,7 +3248,7 @@ export function heartbeatService(db: Db) {
             latestRun,
             comment:
               "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
-              `but it still has no live execution path.${failureSummary ?? ""} ` +
+              `but it still has no live execution path.${failureSummary ?? ""}${workspaceWarningSummary ?? ""} ` +
               "Moving it to `blocked` so it is visible for intervention.",
           });
           if (updated) {
@@ -3267,7 +3285,7 @@ export function heartbeatService(db: Db) {
           latestRun,
           comment:
             "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
-            `execution disappeared, but it still has no live execution path.${failureSummary ?? ""} ` +
+            `execution disappeared, but it still has no live execution path.${failureSummary ?? ""}${workspaceWarningSummary ?? ""} ` +
             "Moving it to `blocked` so it is visible for intervention.",
         });
         if (updated) {
@@ -3864,6 +3882,11 @@ export function heartbeatService(db: Db) {
     let stderrExcerpt = "";
     try {
       const startedAt = run.startedAt ?? new Date();
+      if (runtimeWorkspaceWarnings.length > 0) {
+        context.paperclipWorkspaceWarnings = [...runtimeWorkspaceWarnings];
+      } else {
+        delete context.paperclipWorkspaceWarnings;
+      }
       const runningWithSession = await db
         .update(heartbeatRuns)
         .set({

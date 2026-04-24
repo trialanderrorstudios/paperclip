@@ -246,8 +246,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // gates each tool call. Also prepend an advisory block to the
   // systemPrompt so the agent knows the rules. Always-on — no feature
   // flag. Empty scope = no envelope param sent = no enforcement.
+  //
+  // Escape hatch: agents configured with `dangerouslySkipPermissions: true`
+  // skip BOTH the envelope + canUseTool AND the SDK permission flow.
+  // Without this, setting envelope forces permissionMode="default" (see
+  // below) which makes the SDK expect per-call permission approvals —
+  // nobody answers them in the iPad surface today, so the agent's tool
+  // calls fail with a ZodError. The flag is the explicit operator opt-out.
+  const skipPermissions = config.dangerouslySkipPermissions === true;
   const scope = ctx.scope ?? null;
-  const envelopeParam = scope ? buildEnvelopeFromScope(scope) : null;
+  const envelopeParam = skipPermissions || !scope ? null : buildEnvelopeFromScope(scope);
   const allowedToolsList =
     scope?.allowedTools && scope.allowedTools.length > 0 ? [...scope.allowedTools] : undefined;
   const systemPrompt =
@@ -283,7 +291,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ...buildPaperclipEnv(agent),
   };
   // Also pass auth token so the agent can call back to Paperclip.
-  if (ctx.authToken) paperclipEnv["PAPERCLIP_API_KEY"] = ctx.authToken;
+  // Precedence: ctx.authToken (per-run JWT minted by heartbeat) >
+  // adapterConfig.env.PAPERCLIP_API_KEY (agent's stored key, resolved
+  // by the secrets service before we see it). Without this fallback,
+  // instances without PAPERCLIP_AGENT_JWT_SECRET get a null authToken
+  // AND the stored API key never reaches the wake context — the agent
+  // sees "(not provisioned)" in the context block even though Paperclip
+  // has a valid key on disk.
+  if (ctx.authToken) {
+    paperclipEnv["PAPERCLIP_API_KEY"] = ctx.authToken;
+  } else if (typeof config.env === "object" && config.env !== null) {
+    const storedKey = (config.env as Record<string, unknown>).PAPERCLIP_API_KEY;
+    if (typeof storedKey === "string" && storedKey.length > 0) {
+      paperclipEnv["PAPERCLIP_API_KEY"] = storedKey;
+    }
+  }
 
   // Build the wake prompt. Paperclip's adapter context puts the
   // operator's reason (the Captain's Desk prompt) at context.wakeReason —
@@ -303,6 +325,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     `PAPERCLIP_API_URL=${paperclipEnv.PAPERCLIP_API_URL ?? "http://127.0.0.1:3100"}`,
     `PAPERCLIP_COMPANY_ID=${paperclipEnv.PAPERCLIP_COMPANY_ID ?? ""}`,
     `PAPERCLIP_AGENT_ID=${paperclipEnv.PAPERCLIP_AGENT_ID ?? ""}`,
+    `PAPERCLIP_AGENT_NAME=${agent.name ?? ""}`,
+    // AdapterAgent interface doesn't declare `role` but the heartbeat
+    // passes the full DB row so it's present at runtime.
+    `PAPERCLIP_AGENT_ROLE=${(agent as { role?: string | null }).role ?? ""}`,
     `PAPERCLIP_RUN_ID=${paperclipEnv.PAPERCLIP_RUN_ID ?? ""}`,
     paperclipEnv.PAPERCLIP_API_KEY
       ? `PAPERCLIP_API_KEY=${paperclipEnv.PAPERCLIP_API_KEY}`
@@ -311,6 +337,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     "",
     "Use these literal values in your curl commands — Bash sandbox",
     "does NOT inherit these as env vars. Substitute them directly.",
+    "You already know who you are (name + role above) — don't burn a",
+    "turn on /api/agents/me unless you need richer metadata.",
   ].join("\n");
 
   const wakeText = [contextBlock, rawPrompt, wakePromptSection]
