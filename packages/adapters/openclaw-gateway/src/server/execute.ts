@@ -262,11 +262,21 @@ function truncateForLog(value: string, maxChars = 320): string {
   return `${value.slice(0, maxChars)}... [truncated ${value.length - maxChars} chars]`;
 }
 
+function redactSensitiveText(value: string): string {
+  return value
+    .replace(/(PAPERCLIP_API_KEY=)([^\s]+)/g, (_match, prefix: string, secret: string) => {
+      return `${prefix}${redactSecretForLog(secret)}`;
+    })
+    .replace(/(Authorization:\s*Bearer\s+)([^\s]+)/gi, (_match, prefix: string, secret: string) => {
+      return `${prefix}${redactSecretForLog(secret)}`;
+    });
+}
+
 function redactForLog(value: unknown, keyPath: string[] = [], depth = 0): unknown {
   const currentKey = keyPath[keyPath.length - 1] ?? "";
   if (typeof value === "string") {
     if (isSensitiveLogKey(currentKey)) return redactSecretForLog(value);
-    return truncateForLog(value);
+    return truncateForLog(redactSensitiveText(value));
   }
   if (typeof value === "number" || typeof value === "boolean" || value == null) {
     return value;
@@ -336,6 +346,14 @@ function resolveClaimedApiKeyPath(value: unknown): string {
   return nonEmpty(value) ?? DEFAULT_CLAIMED_API_KEY_PATH;
 }
 
+function resolvePaperclipAgentKey(config: Record<string, unknown>): string | null {
+  const explicit = nonEmpty(config.paperclipAgentKey);
+  if (explicit) return explicit;
+
+  const env = parseObject(config.env);
+  return nonEmpty(env?.PAPERCLIP_API_KEY);
+}
+
 function buildPaperclipEnvForWake(ctx: AdapterExecutionContext, wakePayload: WakePayload): Record<string, string> {
   const paperclipApiUrlOverride = resolvePaperclipApiUrlOverride(ctx.config.paperclipApiUrl);
   const paperclipEnv: Record<string, string> = {
@@ -372,7 +390,8 @@ function buildWakeText(
     return buildOperatorPromptWakeText(payload, paperclipEnv, structuredWakePrompt, config);
   }
 
-  const claimedApiKeyPath = "~/.openclaw/workspace/paperclip-claimed-api-key.json";
+  const paperclipAgentKey = resolvePaperclipAgentKey(config);
+  const claimedApiKeyPath = resolveClaimedApiKeyPath(config.claimedApiKeyPath);
   const orderedKeys = [
     "PAPERCLIP_RUN_ID",
     "PAPERCLIP_AGENT_ID",
@@ -395,6 +414,12 @@ function buildWakeText(
 
   const issueIdHint = payload.taskId ?? payload.issueId ?? "";
   const apiBaseHint = paperclipEnv.PAPERCLIP_API_URL ?? "<set PAPERCLIP_API_URL>";
+  const apiKeyHint = paperclipAgentKey
+    ? `PAPERCLIP_API_KEY=${paperclipAgentKey}`
+    : `PAPERCLIP_API_KEY=<token from ${claimedApiKeyPath}>`;
+  const apiKeyInstruction = paperclipAgentKey
+    ? "Use the PAPERCLIP_API_KEY value above. Do not search for a claimed key file."
+    : `Load PAPERCLIP_API_KEY from ${claimedApiKeyPath} (the token you saved after claim-api-key).`;
 
   const lines = [
     "Paperclip wake event for a cloud adapter.",
@@ -403,9 +428,9 @@ function buildWakeText(
     "",
     "Set these values in your run context:",
     ...envLines,
-    `PAPERCLIP_API_KEY=<token from ${claimedApiKeyPath}>`,
+    apiKeyHint,
     "",
-    `Load PAPERCLIP_API_KEY from ${claimedApiKeyPath} (the token you saved after claim-api-key).`,
+    apiKeyInstruction,
     "",
     `api_base=${apiBaseHint}`,
     `task_id=${payload.taskId ?? ""}`,
@@ -469,7 +494,7 @@ function buildOperatorPromptWakeText(
   structuredWakePrompt: string,
   config: Record<string, unknown>,
 ): string {
-  const paperclipAgentKey = nonEmpty(config.paperclipAgentKey);
+  const paperclipAgentKey = resolvePaperclipAgentKey(config);
   const lines = [
     "Operator task from the board (Overwatch-v3 Captain's Desk).",
     "",
