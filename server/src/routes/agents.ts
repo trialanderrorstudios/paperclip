@@ -2681,8 +2681,38 @@ export function agentRoutes(db: Db) {
     }
     assertCompanyAccess(req, agent.companyId);
 
+    // CEO-of-record orchestration carve-out (-tne, 2026-04-24).
+    //
+    // Three explicit branches when an *agent* (not a board user) calls wakeup:
+    //   1. SELF       — X.id === Y.id (the historic only-allowed path).
+    //   2. MANAGER    — Y.reportsTo === X.id (X is Y's direct manager).
+    //   3. CEO        — X.role === 'ceo' AND X.companyId === Y.companyId
+    //                   (CEOs have standing to wake any agent in their company).
+    //
+    // Anything else still 403s. We do NOT introduce a generic
+    // "any-agent-can-wake-any-agent" path. The orchestration vector
+    // is recorded in the run's contextSnapshot for audit.
+    let wakeOrchestrationVector: "self" | "manager" | "ceo" | "user" = "user";
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
+      const callerAgentId = req.actor.agentId;
+      if (callerAgentId && callerAgentId === id) {
+        wakeOrchestrationVector = "self";
+      } else if (callerAgentId && agent.reportsTo === callerAgentId) {
+        wakeOrchestrationVector = "manager";
+      } else if (callerAgentId) {
+        // Last-resort branch: caller is a CEO in the same company.
+        const caller = await svc.getById(callerAgentId);
+        if (
+          caller &&
+          caller.role === "ceo" &&
+          caller.companyId === agent.companyId
+        ) {
+          wakeOrchestrationVector = "ceo";
+        } else {
+          res.status(403).json({ error: "Agent can only invoke itself" });
+          return;
+        }
+      } else {
         res.status(403).json({ error: "Agent can only invoke itself" });
         return;
       }
@@ -2690,19 +2720,45 @@ export function agentRoutes(db: Db) {
       await assertBoardCanManageAgentsForCompany(req, agent.companyId);
     }
 
+    // If the caller is a manager/CEO and supplied a payload.prompt string,
+    // forward it as the operator prompt by pre-seeding contextSnapshot.wakeReason.
+    // enrichWakeContextSnapshot() (heartbeat.ts) only writes wakeReason when it's
+    // unset, so this seeded value survives and adapters (openclaw-gateway,
+    // claudebridge-local) pick it up via their existing operator-prompt path.
+    const rawPayload = req.body.payload ?? null;
+    const payloadPrompt =
+      rawPayload && typeof (rawPayload as Record<string, unknown>).prompt === "string"
+        ? ((rawPayload as Record<string, unknown>).prompt as string).trim()
+        : "";
+    const orchestrationAllowsPrompt =
+      wakeOrchestrationVector === "manager" ||
+      wakeOrchestrationVector === "ceo" ||
+      wakeOrchestrationVector === "user";
+    const seededWakeReason =
+      orchestrationAllowsPrompt && payloadPrompt.length > 0 ? payloadPrompt : null;
+
+    const contextSnapshot: Record<string, unknown> = {
+      triggeredBy: req.actor.type,
+      actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,
+      forceFreshSession: req.body.forceFreshSession === true,
+      wakeOrchestrationVector,
+    };
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      contextSnapshot.paperclipWakeInvokedBy = req.actor.agentId;
+    }
+    if (seededWakeReason) {
+      contextSnapshot.wakeReason = seededWakeReason;
+    }
+
     const run = await heartbeat.wakeup(id, {
       source: req.body.source,
       triggerDetail: req.body.triggerDetail ?? "manual",
       reason: req.body.reason ?? null,
-      payload: req.body.payload ?? null,
+      payload: rawPayload,
       idempotencyKey: req.body.idempotencyKey ?? null,
       requestedByActorType: req.actor.type === "agent" ? "agent" : "user",
       requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,
-      contextSnapshot: {
-        triggeredBy: req.actor.type,
-        actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,
-        forceFreshSession: req.body.forceFreshSession === true,
-      },
+      contextSnapshot,
     });
 
     if (!run) {
