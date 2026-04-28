@@ -490,7 +490,106 @@ export function autonomyStateMachine(db: Db) {
     return row;
   }
 
-  return { promote, demote, createPromotionProposal };
+  /**
+   * NEW 3 V1.5 (-tne): system-initiated promotion proposal.
+   *
+   * Used by the trust-based promotion reconciler (see
+   * `services/promotion-reconciler.ts`) when an agent rolls past a
+   * configurable trust threshold. Mirrors `createPromotionProposal` but
+   * accepts a `system` actor — the cooldown / step-validation / activity-
+   * emission logic is shared. We do NOT relax the agent-only check on
+   * `createPromotionProposal` because that path is the audit-meaningful
+   * "agent self-petitions" flow; system proposals carry a different
+   * actorType for the audit row so post-hoc analysis can tell them apart.
+   */
+  async function createSystemPromotionProposal(args: {
+    agentId: string;
+    companyId: string;
+    fromLevel: AutonomyLevel;
+    toLevel: AutonomyLevel;
+    actorId: string;
+    signalsSnapshot?: Record<string, unknown>;
+    justification?: string;
+  }) {
+    if (!isValidPromotionStep(args.fromLevel, args.toLevel)) {
+      throw new AutonomyStateMachineError(
+        `invalid promotion step ${args.fromLevel} → ${args.toLevel}`,
+        "invalid_step",
+      );
+    }
+
+    // Same cooldown semantics as the agent-self path. The reconciler
+    // ticks every heartbeatSchedulerIntervalMs (~30s by default) so
+    // without this guard a promotion-eligible agent would generate a
+    // fresh approval row on every tick.
+    const cooldownHours = resolvePromotionCooldownHours();
+    const cooldownCutoff = new Date(Date.now() - cooldownHours * 60 * 60 * 1000);
+    const blockers = await db
+      .select({
+        id: approvals.id,
+        status: approvals.status,
+        createdAt: approvals.createdAt,
+      })
+      .from(approvals)
+      .where(
+        and(
+          eq(approvals.companyId, args.companyId),
+          eq(approvals.requestedByAgentId, args.agentId),
+          eq(approvals.type, "autonomy.promotion"),
+          sql`${approvals.payload} ->> 'toLevel' = ${args.toLevel}`,
+          sql`${approvals.status} IN ('pending', 'rejected')`,
+          sql`${approvals.createdAt} >= ${cooldownCutoff}`,
+        ),
+      )
+      .limit(1);
+    if (blockers[0]) {
+      // Quietly no-op — the reconciler is fire-and-forget and does not
+      // want to surface rate-limit noise as errors.
+      return null;
+    }
+
+    const inserted = await db
+      .insert(approvals)
+      .values({
+        companyId: args.companyId,
+        type: "autonomy.promotion",
+        requestedByAgentId: args.agentId,
+        status: "pending",
+        payload: {
+          agentId: args.agentId,
+          fromLevel: args.fromLevel,
+          toLevel: args.toLevel,
+          signalsSnapshot: args.signalsSnapshot ?? {},
+          justification:
+            args.justification ??
+            `Trust-based auto-proposal: agent met ${args.toLevel} thresholds.`,
+          source: "promotion-reconciler",
+        },
+      })
+      .returning();
+
+    const row = inserted[0];
+    if (row) {
+      await logActivity(db, {
+        companyId: args.companyId,
+        actorType: "system",
+        actorId: args.actorId,
+        agentId: args.agentId,
+        action: "autonomy.proposal.created",
+        entityType: "approval",
+        entityId: row.id,
+        details: {
+          fromLevel: args.fromLevel,
+          toLevel: args.toLevel,
+          source: "promotion-reconciler",
+          signalsSnapshot: args.signalsSnapshot ?? {},
+        },
+      });
+    }
+    return row;
+  }
+
+  return { promote, demote, createPromotionProposal, createSystemPromotionProposal };
 }
 
 async function loadAgentAutonomyView(db: Db, agentId: string): Promise<AgentAutonomyView | null> {

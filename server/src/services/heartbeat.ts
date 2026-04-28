@@ -45,6 +45,7 @@ import {
   autonomyStateMachine,
   effectiveAutonomyLevel,
 } from "./autonomy-state-machine.js";
+import { observeIncidentForDemotion } from "./incident-demotion-observer.js";
 import type { AutonomyLevel } from "@paperclipai/shared";
 import {
   buildAdapterContextScope,
@@ -4104,6 +4105,20 @@ export function heartbeatService(db: Db) {
           await setWakeupStatus(run.wakeupRequestId, "failed", {
             finishedAt: new Date(),
             error: "gated-level agent has empty allowlist envelope",
+          });
+          // NEW 3 V1.5 (-tne): wire incident → demotion. Fire-and-forget
+          // so the violation activity row + run-failure are durable
+          // even if the demotion path errors. For a gated-level agent
+          // this is a no-op (already at floor) — but the call site is
+          // correct for the V1.1 runtime hook that will report the
+          // same `errorCode: 'allowlist.violated'` from a non-gated
+          // tier and need the actual demotion.
+          void observeIncidentForDemotion(db, {
+            agentId: agent.id,
+            companyId: agent.companyId,
+            reason: "allowlist_violation",
+            runId: run.id,
+            note: "runtime envelope deny: gated-level empty envelope",
           });
           const rejectedRun = await getRun(run.id);
           if (rejectedRun) await releaseIssueExecutionAndPromote(rejectedRun);

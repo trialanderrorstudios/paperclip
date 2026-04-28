@@ -35,6 +35,7 @@ import {
   reconcilePersistedRuntimeServicesOnStartup,
   routineService,
 } from "./services/index.js";
+import { runPromotionReconcilerTick } from "./services/promotion-reconciler.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -662,6 +663,22 @@ export async function startServer(): Promise<StartedServer> {
         })
         .catch((err) => {
           logger.error({ err }, "heartbeat-staleness auto-demote failed");
+        });
+
+      // NEW 3 V1.5 (-tne): trust-based promotion reconciler. Walks
+      // active agents and enqueues an `autonomy.promotion` approval row
+      // when their trust score + clean-streak crosses the configured
+      // threshold for the next-tier-up. Cooldown-guarded so a single
+      // eligible agent generates at most one proposal per
+      // AUTONOMY_PROMOTION_COOLDOWN_HOURS window.
+      void runPromotionReconcilerTick(db as any)
+        .then((result) => {
+          if (result.proposalsCreated > 0) {
+            logger.info({ ...result }, "promotion-reconciler tick");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "promotion-reconciler tick failed");
         });
     }, config.heartbeatSchedulerIntervalMs);
   }
